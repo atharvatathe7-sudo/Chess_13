@@ -261,6 +261,8 @@ button:active, button.active {
         </div>
 
         <div class="row controls-flex">
+          <button id="prevMove">‹ Prev</button>
+          <button id="nextMove">Next ›</button>
           <button id="undo">Undo</button>
           <button id="redo">Redo</button>
           <button id="flip">Flip</button>
@@ -268,6 +270,15 @@ button:active, button.active {
           <button id="exportAnim">Export Animation</button>
           <button id="reset">Reset</button>
           <button id="removeToggle">Remove Piece</button>
+        </div>
+
+        <div style="margin-top:8px">
+          <label class="small">Import PGN</label>
+          <textarea id="pgnInput" placeholder="Paste PGN from Chess.com / Lichess here, then press Import." style="width:100%;box-sizing:border-box;height:60px;"></textarea>
+          <div class="row" style="margin-top:4px;">
+            <button id="importPgn">Import PGN</button>
+            <span class="small" id="pgnStatus"></span>
+          </div>
         </div>
 
         <div style="margin-top:8px">
@@ -280,29 +291,10 @@ button:active, button.active {
           <button id="backToLive" style="padding:4px 8px;">Live</button>
         </div>
         <div class="row" style="flex-wrap:wrap;">
-          <label class="small">Annotation</label>
-          <select id="annotationSelect">
-            <option value="">(none)</option>
-            <option value="Brilliant">Brilliant</option>
-            <option value="Best">Best</option>
-            <option value="Good">Good</option>
-            <option value="Book">Book</option>
-            <option value="Inaccuracy">Inaccuracy</option>
-            <option value="Mistake">Mistake</option>
-            <option value="Blunder">Blunder</option>
-            <option value="Check">Check</option>
-            <option value="Checkmate">Checkmate</option>
-          </select>
-          <label class="small">Badge</label>
-          <select id="badgeSelect">
-            <option value="">(none)</option>
-            <option value="!!">!!</option>
-            <option value="!?">!?</option>
-            <option value="?!">?!</option>
-            <option value="?">?</option>
-            <option value="??">??</option>
-            <option value="#">#</option>
-          </select>
+          <label class="small">Classification</label>
+          <!-- One control: picking the classification also sets its
+               conventional symbol (see CLASSIFICATIONS in the script). -->
+          <select id="annotationSelect"></select>
         </div>
 
         <div style="margin-top:8px">
@@ -1122,6 +1114,26 @@ function buildMoveRecord(m, from, to, preSnapshot, movingBefore){
   // not on the destination square itself.
   const extraVacate = flags.includes('e') ? [ to[0] + from[1] ] : [];
 
+  // Check context (Phase 6): buildMoveRecord runs immediately AFTER
+  // game.move() applied the move, so game.in_check() describes the side to
+  // move — i.e. the side this move just put in check. Storing the king's
+  // square here lets the export frame the checking relationship without
+  // re-deriving the position later. Purely a framing input: no evaluation,
+  // no classification, nothing is drawn because of it.
+  let checkSquare = null;
+  try {
+    if(game.in_check()){
+      const checkedColor = game.turn();
+      const b = game.board();
+      for(let r=0; r<8 && !checkSquare; r++){
+        for(let f=0; f<8; f++){
+          const p = b[r][f];
+          if(p && p.type === 'k' && p.color === checkedColor){ checkSquare = 'abcdefgh'[f] + (8-r); break; }
+        }
+      }
+    }
+  } catch(e){ checkSquare = null; }
+
   return {
     ply: moveHistory.length + 1,
     from: m.from || from,
@@ -1138,6 +1150,7 @@ function buildMoveRecord(m, from, to, preSnapshot, movingBefore){
     preSnapshot,                      // deep-cloned board() BEFORE this move
     secondary,                        // {from,to,type:'r',color} for castling's rook, else null
     extraVacate,                      // squares beyond `from` that must be cleared for export (e.g. en passant)
+    checkSquare,                      // square of the king this move puts in check, else null (export framing only)
     annotation: '',                   // human-provided (Phase 3): e.g. "Brilliant" — never computed by the app
     badge: '',                        // human-provided (Phase 3): e.g. "!!" — never computed by the app
     arrows: [],                       // move-scoped arrows (Phase 3): {from,to,color} — belong to THIS ply only
@@ -1247,13 +1260,7 @@ function showPromotionModal(color, callback){
 function animateMoveByPiece(from,to,type,color,durationMs,onComplete){
   const start = squareCenter(from), end = squareCenter(to);
   const img = (pieceImages[color] && pieceImages[color][type]) ? pieceImages[color][type] : null;
-  function after(){ if(onComplete) onComplete(); }
-  if(type === 'n'){ animKnight(start,end,img,durationMs,after); }
-  else if(type === 'b'){ animBishop(start,end,img,durationMs,after); }
-  else if(type === 'r'){ animRook(start,end,img,durationMs,after); }
-  else if(type === 'q'){ animQueen(start,end,img,durationMs,after); }
-  else if(type === 'k'){ animKing(start,end,img,durationMs,after); }
-  else { animPawn(start,end,img,durationMs,after); }
+  animPiece(type, start, end, img, durationMs, ()=>{ if(onComplete) onComplete(); });
 }
 
 // Canonical entry point for animating a move record (used by both the
@@ -1294,7 +1301,16 @@ function animateRecord(record, onComplete){
   }
 
   const dur = computeMoveDuration(record);
-  animateMoveByPiece(record.from, record.to, record.resultPieceType, record.color, dur, settle);
+  // Travel as the piece that ACTUALLY moved (`pieceType`), not as the piece
+  // it becomes. For a promotion that means the pawn makes the journey on
+  // the pawn's own curve and the promoted piece only appears once the move
+  // has landed (drawBoard() in settle() paints the real, promoted board) —
+  // previously the queen/knight was substituted in before the movement was
+  // visually complete, so e.g. a promoted knight was seen sliding straight
+  // up the file like a pawn instead of ever moving like a knight.
+  // For every non-promotion move pieceType === resultPieceType, so nothing
+  // else changes.
+  animateMoveByPiece(record.from, record.to, record.pieceType, record.color, dur, settle);
   if(record.secondary){
     animateMoveByPiece(record.secondary.from, record.secondary.to, record.secondary.type, record.secondary.color, dur, settle);
   }
@@ -1342,14 +1358,102 @@ function cubicBezier(p0,p1,p2,p3,t){ const x = Math.pow(1-t,3)*p0.x + 3*Math.pow
 function easeOutCubic(t){ return 1 - Math.pow(1 - t, 3); }
 function easeInOutCubic(t){ return t<0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2,3)/2; }
 
-// NEW: All anim functions now wrap their effects in save/restore
-// to respect the pan/zoom transform on the overlay.
-function animPawn(start,end,img,duration,onComplete){ const s = LOGICAL_SIZE/8; const t0 = performance.now(); function frame(now){ const t = Math.min(1,(now-t0)/duration), e = easeOutCubic(t); drawBoard(); redrawOverlay(); octx.globalAlpha = 1; const x = start.x + (end.x - start.x)*e; const y = start.y + (end.y - start.y)*e - 6*(1 - Math.abs(0.5 - e)); const scale = 1 + 0.04*(1 - Math.abs(0.5 - e)); octx.save(); octx.translate(viewTransform.panX, viewTransform.panY); octx.scale(viewTransform.scale, viewTransform.scale); octx.beginPath(); octx.fillStyle = `rgba(250,238,88,${0.45*e})`; octx.arc(end.x,end.y, s*(0.2 + 0.4*e),0,Math.PI*2); octx.fill(); octx.restore(); drawMovingImage(img,x,y,scale,0,true); if(t<1) requestAnimationFrame(frame); else { octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE); if(onComplete) onComplete(); } } requestAnimationFrame(frame); }
-function animRook(start,end,img,duration,onComplete){ const s = LOGICAL_SIZE/8; const t0 = performance.now(); function frame(now){ const t = Math.min(1,(now-t0)/duration), e = easeOutCubic(t); drawBoard(); redrawOverlay(); const x = start.x + (end.x - start.x)*e, y = start.y + (end.y - start.y)*e; const bounce = (t>0.85)? (1 + (1 - (t-0.85)/0.15)*0.08) : 1; drawMovingImage(img,x,y,bounce,0,true); if(t>0.7){ const p=(t-0.7)/0.3; octx.save(); octx.translate(viewTransform.panX, viewTransform.panY); octx.scale(viewTransform.scale, viewTransform.scale); octx.beginPath(); octx.fillStyle = `rgba(255,235,150,${0.25*(1-p)})`; octx.arc(end.x,end.y,s*(0.1 + p*0.7),0,Math.PI*2); octx.fill(); octx.restore(); } if(t<1) requestAnimationFrame(frame); else { octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE); if(onComplete) onComplete(); } } requestAnimationFrame(frame); }
-function animBishop(start,end,img,duration,onComplete){ const s = LOGICAL_SIZE/8; const ctrl = { x: (start.x+end.x)/2 + (end.y - start.y)*0.18, y: (start.y+end.y)/2 + (start.x - end.x)*0.18 }; const t0 = performance.now(); function frame(now){ const t = Math.min(1,(now-t0)/duration), e = easeOutCubic(t); drawBoard(); redrawOverlay(); const pos = quadBezier(start, ctrl, end, e); const tilt = (e-0.5)*0.18; octx.globalAlpha = 1; octx.save(); octx.translate(viewTransform.panX, viewTransform.panY); octx.scale(viewTransform.scale, viewTransform.scale); octx.beginPath(); octx.fillStyle = `rgba(180,220,255,${0.14*(1-e)})`; octx.arc(pos.x,pos.y, s*0.22,0,Math.PI*2); octx.fill(); octx.restore(); drawMovingImage(img,pos.x,pos.y,1,tilt,true); if(t<1) requestAnimationFrame(frame); else { octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE); if(onComplete) onComplete(); } } requestAnimationFrame(frame); }
-function animKnight(start,end,img,duration,onComplete){ const s = LOGICAL_SIZE/8; const mid = { x: (start.x+end.x)/2, y: (start.y+end.y)/2 - Math.max( s*0.5, Math.hypot(end.x-start.x,end.y-start.y)*0.28 ) }; const t0 = performance.now(); function frame(now){ const t = Math.min(1,(now-t0)/duration), e = easeOutCubic(t); drawBoard(); redrawOverlay(); const pos = quadBezier(start, mid, end, e); const rotation = Math.PI * (e*1.2); drawMovingImage(img,pos.x,pos.y,1 + 0.06*(1 - Math.abs(0.5 - e)),rotation,true); octx.save(); octx.translate(viewTransform.panX, viewTransform.panY); octx.scale(viewTransform.scale, viewTransform.scale); octx.beginPath(); octx.fillStyle = `rgba(0,0,0,${0.14*(1-e)})`; octx.ellipse(pos.x, pos.y + 24*(1-e), s*0.25, s*0.12*(1-e), 0, 0, Math.PI*2); octx.fill(); octx.restore(); if(t<1) requestAnimationFrame(frame); else { octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE); if(onComplete) onComplete(); } } requestAnimationFrame(frame); }
-function animQueen(start,end,img,duration,onComplete){ const s = LOGICAL_SIZE/8; const ctrl1 = { x: start.x + (end.x - start.x)*0.33 - (end.y - start.y)*0.12, y: start.y + (end.y - start.y)*0.33 + (end.x - start.x)*0.06 }; const ctrl2 = { x: start.x + (end.x - start.x)*0.66 + (end.y - start.y)*0.12, y: start.y + (end.y - start.y)*0.66 - (end.x - start.x)*0.06 }; const t0 = performance.now(); function frame(now){ const t = Math.min(1,(now-t0)/duration), e = easeOutCubic(t); drawBoard(); redrawOverlay(); const pos = cubicBezier(start, ctrl1, ctrl2, end, e); const rotation = (e - 0.5) * Math.PI * 0.35; const scale = 1 + 0.07*(1 - Math.abs(0.5 - e)); drawMovingImage(img,pos.x,pos.y,scale,rotation,true); if(e>0.45 && e<0.65){ octx.save(); octx.translate(viewTransform.panX, viewTransform.panY); octx.scale(viewTransform.scale, viewTransform.scale); octx.beginPath(); octx.fillStyle = `rgba(255,230,120,${(0.65-e)*2})`; octx.arc(pos.x,pos.y, s*0.38*(0.65-e)*4,0,Math.PI*2); octx.fill(); octx.restore(); } if(t<1) requestAnimationFrame(frame); else { octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE); if(onComplete) onComplete(); } } requestAnimationFrame(frame); }
-function animKing(start,end,img,duration,onComplete){ const s = LOGICAL_SIZE/8; const t0 = performance.now(); function frame(now){ const t = Math.min(1,(now-t0)/duration), e = easeInOutCubic(t*0.9); drawBoard(); redrawOverlay(); const x = start.x + (end.x - start.x)*e; const y = start.y + (end.y - start.y)*e - 4*(1 - Math.abs(0.5 - e)); const rotation = (e - 0.5) * 0.08; const scale = 1 + 0.03*(1 - Math.abs(0.5 - e)); drawMovingImage(img,x,y,scale,rotation,true); if(t>0.8){ const g=(t-0.8)/0.2; octx.save(); octx.translate(viewTransform.panX, viewTransform.panY); octx.scale(viewTransform.scale, viewTransform.scale); octx.beginPath(); octx.fillStyle = `rgba(255,245,200,${0.18*(1-g)})`; octx.arc(end.x,end.y, s*0.45*g,0,Math.PI*2); octx.fill(); octx.restore(); } if(t<1) requestAnimationFrame(frame); else { octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE); if(onComplete) onComplete(); } } requestAnimationFrame(frame); }
+/* ---------------- SHARED PIECE TRAJECTORY (single source of truth) ----------------
+   ONE definition of "where is this piece, how big is it, and how is it
+   rotated, at normalized time t" — used by the live on-screen animation,
+   by the export's per-frame rendering, AND by the export camera's framing
+   maths. Previously the live anim* functions and the export each carried
+   their own copy of these curves, which had already drifted apart (the
+   export applied rotation/scale/bob against raw `t` while the live path
+   applied them against the eased `e`), and the camera then approximated
+   the path a third time. A camera fed by an approximation of the movement
+   can always frame something the renderer didn't actually draw, so there
+   is now exactly one function and everything consumes its real output.
+
+   The curves themselves are unchanged from the live (eased) versions —
+   this is a de-duplication, not a re-design of the animation.
+*/
+function pieceTrajectory(type, start, end, t){
+  const s = LOGICAL_SIZE/8;
+  // The king's original curve eases differently (and deliberately stops
+  // slightly short via t*0.9) — preserved exactly.
+  const e = (type === 'k') ? easeInOutCubic(t*0.9) : easeOutCubic(t);
+  const bob = 1 - Math.abs(0.5 - e);
+  if(type === 'n'){
+    const mid = { x: (start.x+end.x)/2, y: (start.y+end.y)/2 - Math.max(s*0.5, Math.hypot(end.x-start.x, end.y-start.y)*0.28) };
+    const p = quadBezier(start, mid, end, e);
+    return {x:p.x, y:p.y, angle: Math.PI*(e*1.2), scale: 1 + 0.06*bob, e};
+  }
+  if(type === 'b'){
+    const ctrl = { x: (start.x+end.x)/2 + (end.y-start.y)*0.18, y: (start.y+end.y)/2 + (start.x-end.x)*0.18 };
+    const p = quadBezier(start, ctrl, end, e);
+    return {x:p.x, y:p.y, angle: (e-0.5)*0.18, scale: 1, e};
+  }
+  if(type === 'r'){
+    const bounce = (t > 0.85) ? (1 + (1 - (t-0.85)/0.15)*0.08) : 1;
+    return {x: start.x + (end.x-start.x)*e, y: start.y + (end.y-start.y)*e, angle: 0, scale: bounce, e};
+  }
+  if(type === 'q'){
+    const ctrl1 = { x: start.x + (end.x-start.x)*0.33 - (end.y-start.y)*0.12, y: start.y + (end.y-start.y)*0.33 + (end.x-start.x)*0.06 };
+    const ctrl2 = { x: start.x + (end.x-start.x)*0.66 + (end.y-start.y)*0.12, y: start.y + (end.y-start.y)*0.66 - (end.x-start.x)*0.06 };
+    const p = cubicBezier(start, ctrl1, ctrl2, end, e);
+    return {x:p.x, y:p.y, angle: (e-0.5)*Math.PI*0.35, scale: 1 + 0.07*bob, e};
+  }
+  if(type === 'k'){
+    return {x: start.x + (end.x-start.x)*e, y: start.y + (end.y-start.y)*e - 4*bob, angle: (e-0.5)*0.08, scale: 1 + 0.03*bob, e};
+  }
+  return {x: start.x + (end.x-start.x)*e, y: start.y + (end.y-start.y)*e - 6*bob, angle: 0, scale: 1 + 0.04*bob, e};
+}
+
+// Per-type decorative flourish drawn behind/under the moving piece on the
+// LIVE overlay only (glows, the knight's ground shadow, the queen's flash).
+// Purely cosmetic and unchanged from the original per-piece functions —
+// kept out of pieceTrajectory() so position/scale/angle stay the single
+// shared truth that the export and the camera can rely on.
+function drawLiveDecoration(type, start, end, st, t){
+  const s = LOGICAL_SIZE/8, e = st.e;
+  function withView(fn){
+    octx.save();
+    octx.translate(viewTransform.panX, viewTransform.panY);
+    octx.scale(viewTransform.scale, viewTransform.scale);
+    fn();
+    octx.restore();
+  }
+  if(type === 'n'){
+    withView(()=>{ octx.beginPath(); octx.fillStyle = `rgba(0,0,0,${0.14*(1-e)})`; octx.ellipse(st.x, st.y + 24*(1-e), s*0.25, s*0.12*(1-e), 0, 0, Math.PI*2); octx.fill(); });
+  } else if(type === 'b'){
+    withView(()=>{ octx.beginPath(); octx.fillStyle = `rgba(180,220,255,${0.14*(1-e)})`; octx.arc(st.x, st.y, s*0.22, 0, Math.PI*2); octx.fill(); });
+  } else if(type === 'r'){
+    if(t > 0.7){ const p = (t-0.7)/0.3; withView(()=>{ octx.beginPath(); octx.fillStyle = `rgba(255,235,150,${0.25*(1-p)})`; octx.arc(end.x, end.y, s*(0.1 + p*0.7), 0, Math.PI*2); octx.fill(); }); }
+  } else if(type === 'q'){
+    if(e > 0.45 && e < 0.65){ withView(()=>{ octx.beginPath(); octx.fillStyle = `rgba(255,230,120,${(0.65-e)*2})`; octx.arc(st.x, st.y, s*0.38*(0.65-e)*4, 0, Math.PI*2); octx.fill(); }); }
+  } else if(type === 'k'){
+    if(t > 0.8){ const g = (t-0.8)/0.2; withView(()=>{ octx.beginPath(); octx.fillStyle = `rgba(255,245,200,${0.18*(1-g)})`; octx.arc(end.x, end.y, s*0.45*g, 0, Math.PI*2); octx.fill(); }); }
+  } else {
+    withView(()=>{ octx.beginPath(); octx.fillStyle = `rgba(250,238,88,${0.45*e})`; octx.arc(end.x, end.y, s*(0.2 + 0.4*e), 0, Math.PI*2); octx.fill(); });
+  }
+}
+
+// The live animation loop — one implementation for every piece type, since
+// the only per-type differences are the trajectory (pieceTrajectory) and
+// the cosmetic flourish (drawLiveDecoration). t0 is anchored to the first
+// real rAF timestamp for the same reason the export does it: a callback
+// delayed past `duration` would otherwise skip the whole animation.
+function animPiece(type,start,end,img,duration,onComplete){
+  let t0 = null;
+  function frame(now){
+    if(t0 === null) t0 = now;
+    const t = Math.min(1, (now - t0)/duration);
+    drawBoard(); redrawOverlay();
+    octx.globalAlpha = 1;
+    const st = pieceTrajectory(type, start, end, t);
+    drawLiveDecoration(type, start, end, st, t);
+    drawMovingImage(img, st.x, st.y, st.scale, st.angle, true);
+    if(t < 1) requestAnimationFrame(frame);
+    else { octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE); if(onComplete) onComplete(); }
+  }
+  requestAnimationFrame(frame);
+}
 
 /* ---------------- CONTROLS (Original + Status Updates) ---------------- */
 // Undo/redo walk `moveHistory` via `historyPointer`, calling chess.js's own
@@ -1358,29 +1462,124 @@ function animKing(start,end,img,duration,onComplete){ const s = LOGICAL_SIZE/8; 
 // keeps lastMoveRecord (and any in-flight animation hide-state) pointing at
 // exactly the move that produced the CURRENT position, so a move that has
 // been undone can never be replayed or exported as if it still applied.
-document.getElementById('undo').addEventListener('click', ()=>{
-  if(historyPointer <= 0) return; // already at the start position
+// One ply backward / forward through the CURRENT history. Undo/Redo and the
+// Prev/Next navigation buttons are the same operation on the same
+// moveHistory/historyPointer — PGN navigation deliberately does not get a
+// second, parallel history system. Both are safe no-ops at the ends.
+function stepBackward(){
+  if(historyPointer <= 0) return false; // already at the start position
   try{
     game.undo();
     historyPointer--;
     syncTransientMoveState();
     updateStatus(); drawBoard(); redrawOverlay(); updateHistory();
-  }catch(e){}
-});
-document.getElementById('redo').addEventListener('click', ()=>{
-  if(historyPointer >= moveHistory.length) return; // nothing to redo
+    return true;
+  }catch(e){ return false; }
+}
+function stepForward(){
+  if(historyPointer >= moveHistory.length) return false; // nothing ahead
   const rec = moveHistory[historyPointer];
   const moveObj = { from: rec.from, to: rec.to };
   if(rec.promotion) moveObj.promotion = rec.promotion;
   let m = null;
   try { m = game.move(moveObj); } catch(e){ m = null; }
-  if(m){
-    historyPointer++;
-    syncTransientMoveState();
-    updateStatus(); drawBoard(); redrawOverlay(); updateHistory();
-  }
-});
+  if(!m) return false;
+  historyPointer++;
+  syncTransientMoveState();
+  updateStatus(); drawBoard(); redrawOverlay(); updateHistory();
+  return true;
+}
+document.getElementById('undo').addEventListener('click', stepBackward);
+document.getElementById('redo').addEventListener('click', stepForward);
+document.getElementById('prevMove').addEventListener('click', stepBackward);
+document.getElementById('nextMove').addEventListener('click', stepForward);
 document.getElementById('reset').addEventListener('click', ()=>{ game.reset(); selectedSquare=null; moveHistory=[]; historyPointer=0; syncTransientMoveState(); updateStatus(); unzoomSmooth(); drawBoard(); redrawOverlay(); updateHistory(); });
+
+/* ---------------- PGN IMPORT (Phase 6) ----------------
+   Brings a real game in from Chess.com / Lichess / anywhere so the user
+   doesn't have to rebuild positions by hand. Deliberately NOT an analysis
+   feature: the PGN is only a source of moves. Nothing is evaluated,
+   classified or looked up, and no engine is involved.
+
+   chess.js stays the only chess authority — it parses the PGN and it
+   validates every move. The moves it reports are then replayed through
+   attemptMove(), the exact same entry point a dragged move uses, so every
+   imported ply gets a normal move record (snapshots, castling/en-passant
+   metadata, check square, empty annotation/arrows/highlights) and behaves
+   identically to a hand-played move everywhere downstream — timeline,
+   selection, preview, export.
+*/
+
+// Strips the parts of PGN that carry no moves: brace comments, rest-of-line
+// comments, NAGs, and parenthesised variations (nesting-aware, so a
+// variation inside a variation is removed with it). Variations are dropped
+// rather than parsed — the mainline is what gets imported.
+function sanitizePgnText(raw){
+  let s = String(raw || '').replace(/\r/g, '');
+  s = s.replace(/\{[^}]*\}/g, ' ');   // { comment }
+  s = s.replace(/;[^\n]*/g, ' ');     // ; comment to end of line
+  let out = '', depth = 0;
+  for(const ch of s){
+    if(ch === '('){ depth++; continue; }
+    if(ch === ')'){ if(depth > 0) depth--; continue; }
+    if(depth === 0) out += ch;
+  }
+  out = out.replace(/\$\d+/g, ' ');   // NAGs ($1, $4, ...)
+  return out;
+}
+
+function importPgn(text){
+  const statusEl = document.getElementById('pgnStatus');
+  function fail(msg){
+    if(statusEl) statusEl.textContent = msg;
+    showMessage(msg, 'error');
+    return false;
+  }
+  if(typeof Chess !== 'function') return fail('Chess engine not loaded yet.');
+  const raw = String(text || '').trim();
+  if(!raw) return fail('Paste a PGN first.');
+
+  // Parse in a throwaway game so a bad PGN can never damage the live one.
+  const probe = new Chess();
+  let ok = false;
+  try { ok = !!probe.load_pgn(sanitizePgnText(raw), {sloppy: true}); } catch(e){ ok = false; }
+  if(!ok){ try { ok = !!probe.load_pgn(raw, {sloppy: true}); } catch(e){ ok = false; } }
+  if(!ok) return fail('Could not read that PGN.');
+
+  const moves = probe.history({verbose: true});
+  if(!moves.length) return fail('That PGN contains no moves.');
+
+  // A PGN may start from a set-up position rather than the initial one.
+  const fenHeader = raw.match(/\[\s*FEN\s+"([^"]+)"\s*\]/i);
+
+  let startedOk = true;
+  if(fenHeader){ try { startedOk = !!game.load(fenHeader[1]); } catch(e){ startedOk = false; } }
+  if(!fenHeader || !startedOk) game.reset();
+
+  selectedSquare = null;
+  moveHistory = [];
+  historyPointer = 0;
+
+  let applied = 0;
+  for(const mv of moves){
+    if(!attemptMove(mv.from, mv.to, mv.promotion || null)) break;
+    applied++;
+  }
+
+  syncTransientMoveState();
+  updateStatus(); drawBoard(); redrawOverlay(); updateHistory();
+
+  if(!applied) return fail('Could not replay that PGN.');
+  const msg = applied === moves.length
+    ? `Imported ${applied} moves.`
+    : `Imported ${applied} of ${moves.length} moves.`;
+  if(statusEl) statusEl.textContent = msg + ' Use Prev/Next or click a move.';
+  showMessage(msg, 'success');
+  return true;
+}
+document.getElementById('importPgn').addEventListener('click', ()=>{
+  importPgn(document.getElementById('pgnInput').value);
+});
 document.getElementById('flip').addEventListener('click', ()=>{ boardFlipped = !boardFlipped; drawBoard(); redrawOverlay(); });
 // Play/Export operate on the ACTIVE record — the selected timeline move if
 // one is selected, else the latest move (getActiveRecord()'s default) —
@@ -1396,8 +1595,14 @@ document.getElementById('backToLive').addEventListener('click', ()=>{ if(history
 // NEW (Phase 3): annotation/badge are USER choices only — the app never
 // computes, verifies, or suggests them. Written straight onto the active
 // move record (never a global), so they never leak to another move.
-document.getElementById('annotationSelect').addEventListener('change', (e)=>{ const rec = getActiveRecord(); if(rec){ rec.annotation = e.target.value; updateTimeline(); } });
-document.getElementById('badgeSelect').addEventListener('change', (e)=>{ const rec = getActiveRecord(); if(rec){ rec.badge = e.target.value; updateTimeline(); redrawOverlay(); } });
+document.getElementById('annotationSelect').addEventListener('change', (e)=>{
+  const rec = getActiveRecord();
+  if(!rec) return;
+  rec.annotation = e.target.value;
+  rec.badge = badgeForClassification(e.target.value); // symbol derived, never chosen separately
+  updateTimeline();
+  redrawOverlay();
+});
 
 /* ---------------- TIMELINE + ANNOTATION UI (Phase 3) ---------------- */
 // Renders only the current active line (plies 1..historyPointer) as
@@ -1443,27 +1648,68 @@ function updateTimeline(){
   }
 }
 
-// Populates the "selected move" label and the annotation/badge selects from
+/* ---------------- MOVE CLASSIFICATION (Phase 6) ----------------
+   Annotation and Badge used to be two separate manual controls that the
+   user had to keep in sync by hand ("Brilliant" *and* "!!"). They are one
+   piece of data: the human's classification of the move, plus the
+   conventional symbol that classification is written with. The user picks
+   the classification once and the symbol follows automatically.
+
+   The existing option names are kept as-is; "Interesting" is the only
+   added label, because the existing list had no term for "!?". Good and
+   Book are deliberately symbol-less — there is no conventional symbol for
+   either, and inventing one would put a mark on the board the notation
+   doesn't have.
+
+   Nothing here is computed or suggested by the app: the user remains the
+   only one who decides whether a move was brilliant or a blunder.
+*/
+const CLASSIFICATIONS = [
+  { value: '',            badge: '',   label: '(none)' },
+  { value: 'Brilliant',   badge: '!!', label: 'Brilliant  !!' },
+  { value: 'Best',        badge: '!',  label: 'Best  !' },
+  { value: 'Good',        badge: '',   label: 'Good' },
+  { value: 'Book',        badge: '',   label: 'Book' },
+  { value: 'Interesting', badge: '!?', label: 'Interesting  !?' },
+  { value: 'Inaccuracy',  badge: '?!', label: 'Inaccuracy  ?!' },
+  { value: 'Mistake',     badge: '?',  label: 'Mistake  ?' },
+  { value: 'Blunder',     badge: '??', label: 'Blunder  ??' },
+  { value: 'Check',       badge: '+',  label: 'Check  +' },
+  { value: 'Checkmate',   badge: '#',  label: 'Checkmate  #' }
+];
+function badgeForClassification(value){
+  const hit = CLASSIFICATIONS.find(c => c.value === value);
+  return hit ? hit.badge : '';
+}
+function buildClassificationOptions(){
+  const sel = document.getElementById('annotationSelect');
+  if(!sel || sel.options.length) return;
+  for(const c of CLASSIFICATIONS){
+    const o = document.createElement('option');
+    o.value = c.value; o.textContent = c.label;
+    sel.appendChild(o);
+  }
+}
+
+// Populates the "selected move" label and the classification select from
 // the active record. Disabled (and cleared) when there's no move yet.
 function updateAnnotationPanel(){
   const labelEl = document.getElementById('selectedMoveLabel');
   const annSel = document.getElementById('annotationSelect');
-  const badgeSel = document.getElementById('badgeSelect');
-  if(!labelEl || !annSel || !badgeSel) return;
+  if(!labelEl || !annSel) return;
+  buildClassificationOptions();
   const rec = getActiveRecord();
   if(!rec){
     labelEl.textContent = 'No move selected';
     annSel.value = ''; annSel.disabled = true;
-    badgeSel.value = ''; badgeSel.disabled = true;
     return;
   }
   const moveNum = Math.ceil(rec.ply / 2);
   const side = rec.color === 'w' ? '.' : '...';
   const live = rec.ply === historyPointer ? ' (live)' : '';
   labelEl.textContent = `Move ${moveNum}${side} ${rec.san || rec.to}${live}`;
-  annSel.disabled = false; badgeSel.disabled = false;
+  annSel.disabled = false;
   annSel.value = rec.annotation || '';
-  badgeSel.value = rec.badge || '';
 }
 
 /* history UI (Original, now move-scoped — Phase 3) */
@@ -1598,7 +1844,13 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     // moving piece's *post-move* type/color is known directly (fixes
     // promotion export showing a pawn instead of the promoted piece — this
     // is exactly what live preview already reads via game.get(to)).
-    const movingType = moveRec.resultPieceType || 'p';
+    // The piece that TRAVELS vs the piece that ENDS UP on the square. These
+    // differ only for a promotion, where the pawn must make the journey on
+    // the pawn's own curve and the promoted piece appears on arrival —
+    // substituting it in up front made a promoted knight travel in a
+    // straight pawn-like line and never move like a knight.
+    const travelType = moveRec.pieceType || moveRec.resultPieceType || 'p';
+    const landType = moveRec.resultPieceType || travelType;
     const movingColor = moveRec.color || 'w';
     const from = moveRec.from, to = moveRec.to;
     const secondary = moveRec.secondary || null; // castling's rook: {from,to,type:'r',color}
@@ -1633,59 +1885,145 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     // --- START FINAL FIX (Padding + Context) ---
     // -------------------------------------------------
 
-    // PADDING FIX: Use 0.5 for margin as requested
-    const margin = LOGICAL_SIZE/8 * 0.5; // "half square" padding
-    // Bounding box covers the FULL piece trajectory — not just the start/end
-    // squares. The animation curves (computePieceState, below — knight's
-    // arc, bishop/queen's bezier bulge) travel visibly outside the straight
-    // line between origin and destination, so a box built only from those
-    // two points was clipping the curve itself (most visible on knight/
-    // bishop/medium queen moves: exactly the "tight/restricted" framing
-    // reported). Sampling the actual curve at several t steps — the same
-    // function used to draw every frame — guarantees the crop always
-    // contains what's actually rendered, for every piece type, without
-    // hardcoding a fixed size. Also includes every currently-active arrow/
-    // highlight (drawOverlayElementsToTemp below renders these into the
-    // export; this keeps the crop from clipping them when they extend past
-    // the move itself, e.g. an arrow from a1->h8 while the move is e2-e4).
-    // squareCenter() is flip-aware, matching how everything is drawn.
-    const boxXs = [];
-    const boxYs = [];
-    const TRAJECTORY_SAMPLES = 12;
+    /* ---------------- CAMERA / FRAMING ----------------
+       Two things were wrong here and they compounded each other.
+
+       1. The crop was squared with max(boxW, boxH) and clamped only by the
+          board itself. A vertical move like Qa1-a8 spans ~7 ranks, so boxH
+          reached the full board height and the square crop therefore became
+          the ENTIRE board — the reported "A1->A8 shows the whole board".
+
+       2. The camera centre was pinned exactly to the moving piece
+          (camX = state.x). A piece drawn dead-centre of the crop in every
+          single frame does not appear to move at all: the board slides
+          underneath it instead. That is why the knight's arc "did not
+          behave as intended" — the arc was being rendered correctly and
+          then cancelled out by the camera following it perfectly.
+
+       The fix is to frame the movement rather than chase the piece:
+
+       - The box is sized from the REAL trajectory (pieceTrajectory — the
+         same function that draws each frame, so the camera can never frame
+         something the renderer didn't draw), capped at MAX_TRAJECTORY_BOX
+         so a long move can't escalate to the whole board.
+       - If the whole trajectory fits in that box, the camera is STATIC and
+         the piece visibly travels across a stationary frame. This is the
+         common case and gives the clearest possible origin->path->landing.
+       - Only when the trajectory genuinely exceeds the cap does the camera
+         move, and then it tracks with a DEAD ZONE: it stays put until the
+         piece approaches the edge of frame, so the piece is always moving
+         relative to the frame rather than glued to its centre.
+       - Arrows/highlights get their own, larger allowance (up to the full
+         board): a static annotation can't be revealed by panning, so it
+         must fit. This preserves the existing annotation-aware crop.
+    */
+    const SQ = LOGICAL_SIZE/8;
+    const margin = SQ * 0.5;              // "half square" padding (unchanged)
+    const MIN_BOX = SQ * 2.8;             // never tighter than ~3 squares of context
+    const MAX_TRAJECTORY_BOX = SQ * 5.2;  // beyond this the camera pans instead of zooming out
+
+    const TRAJECTORY_SAMPLES = 24;
+    const trajXs = [], trajYs = [];
     function addTrajectorySamples(type, start, end){
       for(let i=0;i<=TRAJECTORY_SAMPLES;i++){
-        const st = computePieceState(type, start, end, i/TRAJECTORY_SAMPLES);
-        boxXs.push(st.x); boxYs.push(st.y);
+        const st = pieceTrajectory(type, start, end, i/TRAJECTORY_SAMPLES);
+        // The piece is drawn centred on (x,y) at PIECE_SCALE, so the box has
+        // to contain its drawn extent, not just its centre point.
+        const halfPiece = SQ * PIECE_SCALE * st.scale / 2;
+        trajXs.push(st.x - halfPiece, st.x + halfPiece);
+        trajYs.push(st.y - halfPiece, st.y + halfPiece);
       }
     }
-    addTrajectorySamples(movingType, startCenter, endCenter);
+    addTrajectorySamples(travelType, startCenter, endCenter);
     if(secondary){ addTrajectorySamples(secondary.type, secondaryStartCenter, secondaryEndCenter); }
+
+    const trajMinX = Math.min(...trajXs) - margin, trajMaxX = Math.max(...trajXs) + margin;
+    const trajMinY = Math.min(...trajYs) - margin, trajMaxY = Math.max(...trajYs) + margin;
+    const trajW = trajMaxX - trajMinX, trajH = trajMaxY - trajMinY;
+
+    // Annotations (arrows/highlights) must fit statically — they are never
+    // revealed by camera movement.
+    const annXs = [trajMinX, trajMaxX], annYs = [trajMinY, trajMaxY];
     for(const h of recHighlights){
       const hc = squareCenter(h.sq);
-      boxXs.push(hc.x); boxYs.push(hc.y);
+      annXs.push(hc.x - SQ/2 - margin, hc.x + SQ/2 + margin);
+      annYs.push(hc.y - SQ/2 - margin, hc.y + SQ/2 + margin);
     }
     for(const a of recArrows){
       const ac1 = squareCenter(a.from);
-      boxXs.push(ac1.x); boxYs.push(ac1.y);
-      if(a.to){ const ac2 = squareCenter(a.to); boxXs.push(ac2.x); boxYs.push(ac2.y); }
+      annXs.push(ac1.x - margin, ac1.x + margin); annYs.push(ac1.y - margin, ac1.y + margin);
+      const ac2 = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
+      if(ac2){ annXs.push(ac2.x - margin, ac2.x + margin); annYs.push(ac2.y - margin, ac2.y + margin); }
     }
-    const minX = Math.min(...boxXs) - margin;
-    const maxX = Math.max(...boxXs) + margin;
-    const minY = Math.min(...boxYs) - margin;
-    const maxY = Math.max(...boxYs) + margin;
+    const annW = Math.max(...annXs) - Math.min(...annXs);
+    const annH = Math.max(...annYs) - Math.min(...annYs);
 
-    let boxW = Math.min(LOGICAL_SIZE, Math.max(120, maxX - minX));
-    let boxH = Math.min(LOGICAL_SIZE, Math.max(120, maxY - minY));
+    const cap = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const trajBox = cap(Math.max(trajW, trajH), MIN_BOX, Math.min(MAX_TRAJECTORY_BOX, LOGICAL_SIZE));
+    // Only annotations may push the box past the trajectory cap. annXs/annYs
+    // are seeded with the trajectory bounds so that an annotation box also
+    // contains the move — but when there are no annotations at all that
+    // seeding would hand the UNCAPPED trajectory extent straight back and
+    // silently undo the cap, which is what still made Qa1-a8 open out to
+    // the whole board.
+    const hasAnnotations = recHighlights.length > 0 || recArrows.length > 0;
+    const annBox  = hasAnnotations ? cap(Math.max(annW, annH), MIN_BOX, LOGICAL_SIZE) : 0;
+    const boxSize = Math.min(LOGICAL_SIZE, Math.max(trajBox, annBox));
 
-    // make square crop (export square) by expanding
-    const boxSize = Math.min(LOGICAL_SIZE, Math.max(boxW, boxH));
+    // Centre of the whole framed event (trajectory + annotations).
+    const eventCX = (Math.min(...annXs) + Math.max(...annXs))/2;
+    const eventCY = (Math.min(...annYs) + Math.max(...annYs))/2;
 
-    // center
-    const boxCX = (minX + maxX)/2;
-    const boxCY = (minY + maxY)/2;
-    // compute crop coordinates (clamped)
-    let cropX = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, boxCX - boxSize/2));
-    let cropY = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, boxCY - boxSize/2));
+    // Camera path, decided per axis and evaluated from the piece's own eased
+    // progress so camera and piece can never disagree about where we are in
+    // the move.
+    //
+    //  - Axis fits in the frame  -> the camera does not move on that axis.
+    //    The piece travels across a still frame, which is the clearest way
+    //    to read origin -> path -> landing, and covers every short/medium
+    //    move plus anything an annotation widened.
+    //  - Axis does not fit       -> a tracking shot. The camera leads the
+    //    piece at the start and trails it at the end by `inset`, so the
+    //    piece sweeps from one side of the frame to the other while the
+    //    camera covers LESS ground than the piece does. That is what keeps
+    //    the movement visible: a camera that travels exactly as far as the
+    //    piece (or worse, sits on it) renders the piece motionless.
+    const INSET_FRACTION = 0.30;   // piece rests 30% off-centre at each end
+    function cameraPathForAxis(p0, p1, extent, staticCentre){
+      if(extent <= boxSize + 0.5) return [staticCentre, staticCentre];
+      const dir = Math.sign(p1 - p0) || 1;
+      const inset = Math.min(boxSize * INSET_FRACTION, Math.abs(p1 - p0)/2);
+      return [p0 + inset*dir, p1 - inset*dir];
+    }
+    // Castling moves two pieces, so the camera follows their midpoint.
+    const focusStart = secondary
+      ? {x:(startCenter.x + secondaryStartCenter.x)/2, y:(startCenter.y + secondaryStartCenter.y)/2}
+      : startCenter;
+    const focusEnd = secondary
+      ? {x:(endCenter.x + secondaryEndCenter.x)/2, y:(endCenter.y + secondaryEndCenter.y)/2}
+      : endCenter;
+    const [camX0, camX1] = cameraPathForAxis(focusStart.x, focusEnd.x, trajW, eventCX);
+    const [camY0, camY1] = cameraPathForAxis(focusStart.y, focusEnd.y, trajH, eventCY);
+
+    // ---- End-of-move framing (check context) ----
+    // A checking move is a two-beat event: the piece completes its journey,
+    // then the frame settles to make the resulting check readable. During
+    // the hold the camera/box ease toward a framing that contains both the
+    // landing square and the king that is now in check. No effects are
+    // added — this is framing only.
+    const checkSq = moveRec.checkSquare ? squareCenter(moveRec.checkSquare) : null;
+    let holdBox = boxSize, holdCamX = camX1, holdCamY = camY1;
+    if(checkSq){
+      const cxs = [endCenter.x - SQ/2 - margin, endCenter.x + SQ/2 + margin, checkSq.x - SQ/2 - margin, checkSq.x + SQ/2 + margin];
+      const cys = [endCenter.y - SQ/2 - margin, endCenter.y + SQ/2 + margin, checkSq.y - SQ/2 - margin, checkSq.y + SQ/2 + margin];
+      holdBox = cap(Math.max(Math.max(...cxs) - Math.min(...cxs), Math.max(...cys) - Math.min(...cys)), MIN_BOX, LOGICAL_SIZE);
+      holdBox = Math.max(holdBox, Math.min(boxSize, LOGICAL_SIZE));
+      holdCamX = (Math.min(...cxs) + Math.max(...cxs))/2;
+      holdCamY = (Math.min(...cys) + Math.max(...cys))/2;
+    }
+    // A short beat after the landing so the move reads as "arrived" (and,
+    // for a check, long enough to take in the checking relationship).
+    const holdMs = checkSq ? 850 : 260;
 
     // --- CONTEXT FIX: These functions are now restored ---
     // These functions are helpers *inside* exportLastMoveAsWebM
@@ -1754,44 +2092,6 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     // -------------------------------------------------
     // --- END FINAL FIX (Padding + Context) ---
     // -------------------------------------------------
-
-    // compute moving piece state for given t (0..1)
-    function computePieceState(type, start, end, t){
-      // This function is identical to the one in Chess_l.html,
-      // correctly calculating the cinematic path.
-      if(type === 'n'){
-        const mid = { x: (start.x+end.x)/2, y: (start.y+end.y)/2 - Math.max( LOGICAL_SIZE/8*0.5, Math.hypot(end.x-start.x,end.y-start.y)*0.28 ) };
-        const p = quadBezier(start, mid, end, easeOutCubic(t));
-        const angle = Math.PI * (t*1.2);
-        const sc = 1 + 0.06*(1 - Math.abs(0.5 - t));
-        return {x:p.x,y:p.y,angle,scale:sc};
-      } else if(type === 'b'){
-        const ctrl = { x: (start.x+end.x)/2 + (end.y - start.y)*0.18, y: (start.y+end.y)/2 + (start.x - end.x)*0.18 };
-        const p = quadBezier(start, ctrl, end, easeOutCubic(t));
-        const angle = (t-0.5)*0.18;
-        return {x:p.x,y:p.y,angle,scale:1};
-      } else if(type === 'r'){
-        const p = { x: start.x + (end.x - start.x)*easeOutCubic(t), y: start.y + (end.y - start.y)*easeOutCubic(t) };
-        const bounce = (t>0.85)? (1 + (1 - (t-0.85)/0.15)*0.08) : 1;
-        return {x:p.x,y:p.y,angle:0,scale:bounce};
-      } else if(type === 'q'){
-        const ctrl1 = { x: start.x + (end.x - start.x)*0.33 - (end.y - start.y)*0.12, y: start.y + (end.y - start.y)*0.33 + (end.x - start.x)*0.06 };
-        const ctrl2 = { x: start.x + (end.x - start.x)*0.66 + (end.y - start.y)*0.12, y: start.y + (end.y - start.y)*0.66 - (end.x - start.x)*0.06 };
-        const p = cubicBezier(start, ctrl1, ctrl2, end, easeOutCubic(t));
-        const angle = (t - 0.5) * Math.PI * 0.35;
-        const sc = 1 + 0.07*(1 - Math.abs(0.5 - t));
-        return {x:p.x,y:p.y,angle,scale:sc};
-      } else if(type === 'k'){
-        const p = { x: start.x + (end.x - start.x)*easeInOutCubic(t*0.9), y: start.y + (end.y - start.y)*easeInOutCubic(t*0.9) - 4*(1 - Math.abs(0.5 - t)) };
-        const angle = (t - 0.5) * 0.08;
-        const sc = 1 + 0.03*(1 - Math.abs(0.5 - t));
-        return {x:p.x,y:p.y,angle,scale:sc};
-      } else {
-        const p = { x: start.x + (end.x - start.x)*easeOutCubic(t), y: start.y + (end.y - start.y)*easeOutCubic(t) - 6*(1 - Math.abs(0.5 - t)) };
-        const sc = 1 + 0.04*(1 - Math.abs(0.5 - t));
-        return {x:p.x,y:p.y,angle:0,scale:sc};
-      }
-    }
 
     // Draws one moving piece (image, or glyph fallback) onto the temp
     // canvas at the given computed state. Factored out so castling can call
@@ -1897,7 +2197,7 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
 
     // Start recorder
     recorder.start();
-    showMessage('Recording... Please wait.', 'success', duration + 500);
+    showMessage('Recording... Please wait.', 'success', duration + holdMs + 500);
 
     // Produce frames: one rendered+pushed frame per requestAnimationFrame
     // tick, throttled to ~fps (via minFrameIntervalMs) so file size/frame
@@ -1922,6 +2222,8 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       if(t0 === null) t0 = now;
       const elapsed = now - t0;
       const t = Math.min(1, elapsed / duration);
+      // Hold progress (0..1) for the beat AFTER the piece has landed.
+      const h = holdMs > 0 ? Math.max(0, Math.min(1, (elapsed - duration) / holdMs)) : 1;
 
       // -------------------------------------------------
       // --- START RENDER LOOP (with Context) ---
@@ -1931,16 +2233,18 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       drawBoardToTemp();
 
       // 2. Compute moving piece state at t, and the secondary (rook) piece's
-      //    state too when castling — same computePieceState() math, just
-      //    called a second time with the rook's own start/end/type.
-      const state = computePieceState(movingType, startCenter, endCenter, t);
+      //    state too when castling — same pieceTrajectory() the live
+      //    animation and the camera framing use.
+      const state = pieceTrajectory(travelType, startCenter, endCenter, t);
       let secondaryState = null;
       if(secondary){
-        secondaryState = computePieceState(secondary.type, secondaryStartCenter, secondaryEndCenter, t);
+        secondaryState = pieceTrajectory(secondary.type, secondaryStartCenter, secondaryEndCenter, t);
       }
 
-      // 3. Draw the moving piece(s) on top of the context
-      drawMovingPieceToTemp(movingColor, movingType, state);
+      // 3. Draw the moving piece(s) on top of the context. A promotion only
+      //    becomes the promoted piece once the pawn has actually arrived.
+      const drawnType = (t >= 1) ? landType : travelType;
+      drawMovingPieceToTemp(movingColor, drawnType, state);
       if(secondary){
         drawMovingPieceToTemp(secondary.color, secondary.type, secondaryState);
       }
@@ -1949,22 +2253,32 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       // --- END RENDER LOOP ---
       // -------------------------------------------------
 
-      // 4. Compute dynamic camera center following the piece's ACTUAL
-      //    rendered position (state.x/y — the same curved point just drawn
-      //    in step 3), not a straight-line lerp from start->end. The old
-      //    straight-line camera could drift away from where the piece
-      //    genuinely is on a curved path (knight/bishop/queen), which,
-      //    combined with a too-tight box, could let the piece visibly slip
-      //    toward the edge of frame mid-flight. For castling, follow the
-      //    midpoint of both pieces' actual positions so king and rook stay
-      //    framed throughout.
-      const camX = secondary ? (state.x + secondaryState.x)/2 : state.x;
-      const camY = secondary ? (state.y + secondaryState.y)/2 : state.y;
+      // 4. Advance the camera. NOT pinned to the piece: a piece held at the
+      //    exact centre of every frame reads as motionless while the board
+      //    slides past it, which is what made the movement (the knight's arc
+      //    especially) look like it wasn't happening. When the whole
+      //    trajectory fits the frame the camera simply doesn't move and the
+      //    piece travels across a static shot. Otherwise it tracks with a
+      //    dead zone, so it only gives ground once the piece nears the edge
+      //    and the piece still moves relative to the frame.
+      // The camera advances on the SAME eased progress the piece uses, so
+      // the two never disagree — but over a shorter distance, which is what
+      // makes the piece visibly travel across the frame.
+      const prog = state.e;
+      const camX = camX0 + (camX1 - camX0) * prog;
+      const camY = camY0 + (camY1 - camY0) * prog;
+
+      // Ease toward the end framing during the hold (only differs from the
+      // movement framing when this move gives check).
+      const settle = easeInOutCubic(h);
+      const frameBox = boxSize + (holdBox - boxSize) * settle;
+      const frameCamX = camX + (holdCamX - camX) * settle;
+      const frameCamY = camY + (holdCamY - camY) * settle;
 
       // Compute crop (ensure crop fits inside board)
-      const half = boxSize / 2;
-      let sx = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, camX - half));
-      let sy = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, camY - half));
+      const half = frameBox / 2;
+      let sx = Math.max(0, Math.min(LOGICAL_SIZE - frameBox, frameCamX - half));
+      let sy = Math.max(0, Math.min(LOGICAL_SIZE - frameBox, frameCamY - half));
 
       // 5. Draw cropped region from temp (transparent) canvas to final
       //    (export) canvas. sx/sy/boxSize are in the 0..LOGICAL_SIZE
@@ -1976,18 +2290,18 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       ectx.clearRect(0,0,EXPORT_SIZE,EXPORT_SIZE);
       ectx.drawImage(
         temp,
-        sx*EXPORT_RENDER_SCALE, sy*EXPORT_RENDER_SCALE, boxSize*EXPORT_RENDER_SCALE, boxSize*EXPORT_RENDER_SCALE,
+        sx*EXPORT_RENDER_SCALE, sy*EXPORT_RENDER_SCALE, frameBox*EXPORT_RENDER_SCALE, frameBox*EXPORT_RENDER_SCALE,
         0, 0, EXPORT_SIZE, EXPORT_SIZE
       );
 
       // 6. Push exactly this frame into the capture stream (manual mode
       //    only — the auto-rate fallback captures on its own clock).
-      if(canRequestFrame && (now - lastPushedAt >= minFrameIntervalMs || t >= 1)){
+      if(canRequestFrame && (now - lastPushedAt >= minFrameIntervalMs || h >= 1)){
         track.requestFrame();
         lastPushedAt = now;
       }
 
-      if(t < 1){
+      if(h < 1){
         requestAnimationFrame(frameStep);
       } else {
         finished = true;
