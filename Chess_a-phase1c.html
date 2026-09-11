@@ -333,10 +333,13 @@ let selectedSquare = null;
 let dragging = null;
 let boardFlipped = false;
 let removeMode = false;
-let lastMoveRecord = null; // {from,to,piece?,color?,type?}
-let prevBoardSnapshot = null; // snapshot BEFORE last move (used for export)
-let prevMovingPieceInfo = null; // {type,color}
-let animHideSquare = null; // square whose piece is currently mid-flight in an animation (hide the static copy)
+// Per-ply move history (undo/redo without replacing chess.js, and a single
+// rich record per move that live animation and export both read from — see
+// buildMoveRecord() and syncTransientMoveState() below).
+let moveHistory = []; // append-only move records
+let historyPointer = 0; // moveHistory[0..historyPointer-1] are currently applied to `game`
+let lastMoveRecord = null; // always mirrors moveHistory[historyPointer-1], or null at the start position
+let animHideSquares = new Set(); // squares whose pieces are mid-flight (hide the static copy); a Set so castling can hide both the king's and rook's destination squares at once
 const pieceTypes = ['k','q','r','b','n','p'];
 const pieceImages = { w: {}, b: {} };
 const PIECE_LOAD_TIMEOUT = 1200;
@@ -560,7 +563,7 @@ function drawPieces(){
       // NEW: Don't draw if dragging
       const sq = 'abcdefgh'[f] + (8 - r);
       if(dragging && dragging.from === sq) continue;
-      if(animHideSquare && animHideSquare === sq) continue;
+      if(animHideSquares.has(sq)) continue;
       
       const visFile = boardFlipped ? (7 - f) : f;
       const visRank = boardFlipped ? (7 - r) : r;
@@ -918,7 +921,7 @@ function onUp(e){
             const res = attemptMove(fromSq, sq, choice); 
             dragging=null; selectedSquare=null; 
             if(res) {
-                animateMoveByPiece(res.from,res.to,ANIM_DURATION_MS, ()=>{ drawBoard(); redrawOverlay(); updateHistory(); updateStatus(); });
+                animateRecord(lastMoveRecord, ()=>{ drawBoard(); redrawOverlay(); updateHistory(); updateStatus(); });
             } else {
                 redrawOverlay(); // Redraw to clear legal moves
             }
@@ -927,7 +930,7 @@ function onUp(e){
         const res = attemptMove(dragging.from, sq, null);
         dragging=null; selectedSquare=null;
         if(res) {
-            animateMoveByPiece(res.from,res.to,ANIM_DURATION_MS, ()=>{ drawBoard(); redrawOverlay(); updateHistory(); updateStatus(); });
+            animateRecord(lastMoveRecord, ()=>{ drawBoard(); redrawOverlay(); updateHistory(); updateStatus(); });
         } else {
             redrawOverlay(); // Redraw to clear legal moves
         }
@@ -968,23 +971,84 @@ function onCancel(e){
 
 /* ---------------- MOVE APPLY (Original + Status Update) ---------------- */
 function attemptMove(from,to,promotion){
-  prevBoardSnapshot = JSON.parse(JSON.stringify(game.board()));
-  prevMovingPieceInfo = game.get(from) ? {type: game.get(from).type, color: game.get(from).color} : null;
+  const preSnapshot = JSON.parse(JSON.stringify(game.board()));
+  const movingBefore = game.get(from) ? {type: game.get(from).type, color: game.get(from).color} : null;
 
   const moveObj = {from: from, to: to}; if(promotion) moveObj.promotion = promotion;
   let m = null;
   try { m = (typeof game.move === 'function') ? game.move(moveObj) : null; } catch(e){ m = null; }
-  
+
   if(m){
-    lastMoveRecord = {from: m.from || from, to: m.to || to, piece: m.piece || null};
-    if(!prevMovingPieceInfo && m && m.color && m.piece) prevMovingPieceInfo = { type: (m.piece || 'p'), color: m.color || 'w' };
-    
+    const record = buildMoveRecord(m, from, to, preSnapshot, movingBefore);
+    // A new move discards any redo-able future branch (standard undo/redo semantics).
+    if(historyPointer < moveHistory.length) moveHistory.length = historyPointer;
+    moveHistory.push(record);
+    historyPointer = moveHistory.length;
+    syncTransientMoveState();
+
     updateStatus(); // <-- NEW
-    return {from: lastMoveRecord.from, to: lastMoveRecord.to};
+    return {from: record.from, to: record.to};
   } else {
     // Invalid move
     return null;
   }
+}
+
+/* ---------------- PER-PLY MOVE RECORD ----------------
+   One record per ply, rich enough for both live animation and export to
+   reconstruct exactly what changed — including the pieces that a naive
+   "only the from-square was vacated" assumption misses: the rook in
+   castling, and the captured pawn's square in en passant (which is not
+   the destination square). `annotation`/`badge` are reserved for a later
+   phase and intentionally left empty here.
+*/
+function buildMoveRecord(m, from, to, preSnapshot, movingBefore){
+  const flags = m.flags || '';
+  const color = m.color || (movingBefore && movingBefore.color) || 'w';
+  const pieceTypeBefore = (movingBefore && movingBefore.type) || m.piece || 'p';
+  const resultPieceType = m.promotion ? m.promotion : pieceTypeBefore;
+
+  // Castling also moves the rook; chess.js's move object only describes the
+  // king's from/to, so the rook's own squares are derived from the flag+color.
+  let secondary = null;
+  if(flags.includes('k') || flags.includes('q')){
+    const rank = color === 'w' ? '1' : '8';
+    secondary = flags.includes('k')
+      ? { from: 'h'+rank, to: 'f'+rank, type: 'r', color }
+      : { from: 'a'+rank, to: 'd'+rank, type: 'r', color };
+  }
+
+  // En passant's captured pawn sits on (destination file, origin rank) —
+  // not on the destination square itself.
+  const extraVacate = flags.includes('e') ? [ to[0] + from[1] ] : [];
+
+  return {
+    ply: moveHistory.length + 1,
+    from: m.from || from,
+    to: m.to || to,
+    san: m.san || null,
+    color,
+    pieceType: pieceTypeBefore,       // piece type BEFORE the move (e.g. 'p' for a promoting pawn)
+    resultPieceType,                  // piece type AFTER the move (promoted piece, if any)
+    captured: m.captured || null,
+    promotion: m.promotion || null,
+    flags,
+    isCastle: !!secondary,
+    isEnPassant: flags.includes('e'),
+    preSnapshot,                      // deep-cloned board() BEFORE this move
+    secondary,                        // {from,to,type:'r',color} for castling's rook, else null
+    extraVacate,                      // squares beyond `from` that must be cleared for export (e.g. en passant)
+    annotation: '',                   // reserved for a later phase (human-provided)
+    badge: ''                         // reserved for a later phase (human-provided)
+  };
+}
+
+// Keeps lastMoveRecord/animHideSquares in lockstep with historyPointer so
+// Play Animation / Export can never reference a move that isn't the current
+// position's last move (fixes stale replay/export after undo/redo).
+function syncTransientMoveState(){
+  animHideSquares.clear();
+  lastMoveRecord = historyPointer > 0 ? moveHistory[historyPointer - 1] : null;
 }
 
 /* ---------------- NEW: Upgraded Promotion UI (using Glyphs) ---------------- */
@@ -1009,24 +1073,46 @@ function showPromotionModal(color, callback){
 
 
 /* ---------------- ON-SCREEN ANIMATION (MODIFIED for Pan/Zoom) ---------------- */
-function animateMoveByPiece(from,to,durationMs,onComplete){
-  const piece = game.get(to) || (prevMovingPieceInfo || {type:'p', color:'w'});
-  const type = piece.type || 'p';
-  const color = piece.color || 'w';
+// Animates a single piece from `from` to `to`. Caller supplies the exact
+// type/color to draw (instead of this function guessing it) and is
+// responsible for animHideSquares — that lets animateRecord() below drive
+// two of these in parallel for castling without them fighting over shared
+// hide-state or duration-completion bookkeeping.
+function animateMoveByPiece(from,to,type,color,durationMs,onComplete){
   const start = squareCenter(from), end = squareCenter(to);
   const img = (pieceImages[color] && pieceImages[color][type]) ? pieceImages[color][type] : null;
-  animHideSquare = to; // hide the static "already arrived" piece until the flight finishes
-  function after(){
-    animHideSquare = null;
-    lastMoveRecord = {from,to,type,color: color};
-    if(onComplete) onComplete();
-  }
+  function after(){ if(onComplete) onComplete(); }
   if(type === 'n'){ animKnight(start,end,img,durationMs,after); }
   else if(type === 'b'){ animBishop(start,end,img,durationMs,after); }
   else if(type === 'r'){ animRook(start,end,img,durationMs,after); }
   else if(type === 'q'){ animQueen(start,end,img,durationMs,after); }
   else if(type === 'k'){ animKing(start,end,img,durationMs,after); }
   else { animPawn(start,end,img,durationMs,after); }
+}
+
+// Canonical entry point for animating a move record (used by both the
+// post-move animation and "Play Animation"). Reuses the exact same
+// per-piece-type curves above — for castling it just runs the king's and
+// rook's animations in parallel, using the existing rook curve for the
+// rook, rather than introducing any new animation system.
+function animateRecord(record, onComplete){
+  if(!record){ if(onComplete) onComplete(); return; }
+  const toHide = record.secondary ? [record.to, record.secondary.to] : [record.to];
+  toHide.forEach(sq => animHideSquares.add(sq));
+
+  let pending = record.secondary ? 2 : 1;
+  function settle(){
+    pending--;
+    if(pending === 0){
+      toHide.forEach(sq => animHideSquares.delete(sq));
+      if(onComplete) onComplete();
+    }
+  }
+
+  animateMoveByPiece(record.from, record.to, record.resultPieceType, record.color, ANIM_DURATION_MS, settle);
+  if(record.secondary){
+    animateMoveByPiece(record.secondary.from, record.secondary.to, record.secondary.type, record.secondary.color, ANIM_DURATION_MS, settle);
+  }
 }
 
 /* animation implementations */
@@ -1062,11 +1148,38 @@ function animQueen(start,end,img,duration,onComplete){ const s = LOGICAL_SIZE/8;
 function animKing(start,end,img,duration,onComplete){ const s = LOGICAL_SIZE/8; const t0 = performance.now(); function frame(now){ const t = Math.min(1,(now-t0)/duration), e = easeInOutCubic(t*0.9); drawBoard(); redrawOverlay(); const x = start.x + (end.x - start.x)*e; const y = start.y + (end.y - start.y)*e - 4*(1 - Math.abs(0.5 - e)); const rotation = (e - 0.5) * 0.08; const scale = 1 + 0.03*(1 - Math.abs(0.5 - e)); drawMovingImage(img,x,y,scale,rotation,true); if(t>0.8){ const g=(t-0.8)/0.2; octx.save(); octx.translate(viewTransform.panX, viewTransform.panY); octx.scale(viewTransform.scale, viewTransform.scale); octx.beginPath(); octx.fillStyle = `rgba(255,245,200,${0.18*(1-g)})`; octx.arc(end.x,end.y, s*0.45*g,0,Math.PI*2); octx.fill(); octx.restore(); } if(t<1) requestAnimationFrame(frame); else { octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE); if(onComplete) onComplete(); } } requestAnimationFrame(frame); }
 
 /* ---------------- CONTROLS (Original + Status Updates) ---------------- */
-document.getElementById('undo').addEventListener('click', ()=>{ try{ game.undo(); updateStatus(); drawBoard(); redrawOverlay(); updateHistory(); }catch(e){} });
-document.getElementById('reset').addEventListener('click', ()=>{ game.reset(); arrows=[]; highlights=[]; selectedSquare=null; prevBoardSnapshot=null; prevMovingPieceInfo=null; lastMoveRecord=null; animHideSquare=null; updateStatus(); unzoomSmooth(); drawBoard(); redrawOverlay(); updateHistory(); });
+// Undo/redo walk `moveHistory` via `historyPointer`, calling chess.js's own
+// move()/undo() to keep the authoritative position in sync — no duplicate
+// chess engine, no separate move-legality logic. syncTransientMoveState()
+// keeps lastMoveRecord (and any in-flight animation hide-state) pointing at
+// exactly the move that produced the CURRENT position, so a move that has
+// been undone can never be replayed or exported as if it still applied.
+document.getElementById('undo').addEventListener('click', ()=>{
+  if(historyPointer <= 0) return; // already at the start position
+  try{
+    game.undo();
+    historyPointer--;
+    syncTransientMoveState();
+    updateStatus(); drawBoard(); redrawOverlay(); updateHistory();
+  }catch(e){}
+});
+document.getElementById('redo').addEventListener('click', ()=>{
+  if(historyPointer >= moveHistory.length) return; // nothing to redo
+  const rec = moveHistory[historyPointer];
+  const moveObj = { from: rec.from, to: rec.to };
+  if(rec.promotion) moveObj.promotion = rec.promotion;
+  let m = null;
+  try { m = game.move(moveObj); } catch(e){ m = null; }
+  if(m){
+    historyPointer++;
+    syncTransientMoveState();
+    updateStatus(); drawBoard(); redrawOverlay(); updateHistory();
+  }
+});
+document.getElementById('reset').addEventListener('click', ()=>{ game.reset(); arrows=[]; highlights=[]; selectedSquare=null; moveHistory=[]; historyPointer=0; syncTransientMoveState(); updateStatus(); unzoomSmooth(); drawBoard(); redrawOverlay(); updateHistory(); });
 document.getElementById('flip').addEventListener('click', ()=>{ boardFlipped = !boardFlipped; drawBoard(); redrawOverlay(); });
-document.getElementById('playAnim').addEventListener('click', ()=>{ if(lastMoveRecord) animateMoveByPiece(lastMoveRecord.from, lastMoveRecord.to, ANIM_DURATION_MS, ()=>{ drawBoard(); redrawOverlay(); updateHistory(); updateStatus(); }); });
-document.getElementById('exportAnim').addEventListener('click', ()=>{ if(!lastMoveRecord || !prevBoardSnapshot){ showMessage('Make a move first (drag a piece). Export records the last move.', 'error'); return; } exportLastMoveAsWebM({from: lastMoveRecord.from, to: lastMoveRecord.to, preSnapshot: prevBoardSnapshot, movingPiece: prevMovingPieceInfo}, {fps: EXPORT_FPS, duration: ANIM_DURATION_MS}); });
+document.getElementById('playAnim').addEventListener('click', ()=>{ if(lastMoveRecord) animateRecord(lastMoveRecord, ()=>{ drawBoard(); redrawOverlay(); updateHistory(); updateStatus(); }); });
+document.getElementById('exportAnim').addEventListener('click', ()=>{ if(!lastMoveRecord){ showMessage('Make a move first (drag a piece). Export records the last move.', 'error'); return; } exportLastMoveAsWebM(lastMoveRecord, {fps: EXPORT_FPS, duration: ANIM_DURATION_MS}); });
 const removeBtn = document.getElementById('removeToggle'); removeBtn.addEventListener('click', ()=>{ removeMode = !removeMode; removeBtn.classList.toggle('active', removeMode); removeBtn.textContent = removeMode ? 'Remove: ON' : 'Remove Piece'; });
 document.getElementById('clearAll').addEventListener('click', ()=>{ arrows=[]; highlights=[]; redrawOverlay(); updateHistory(); });
 
@@ -1154,23 +1267,38 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
     const exportCanvas = document.createElement('canvas'); exportCanvas.width = EXPORT_SIZE; exportCanvas.height = EXPORT_SIZE;
     const ectx = exportCanvas.getContext('2d', {alpha:true});
 
-    // prepare snapshot and moving info
-    const preSnapshot = moveRec.preSnapshot || prevBoardSnapshot || game.board();
-    const movingInfo = moveRec.movingPiece || prevMovingPieceInfo || (game.get(moveRec.to) || game.get(moveRec.from) || {type:'p', color:'w'});
-    const movingType = movingInfo.type || 'p';
-    const movingColor = movingInfo.color || 'w';
+    // prepare snapshot and moving info — moveRec is now the rich per-ply
+    // record built by buildMoveRecord() (see MOVE APPLY section), so the
+    // moving piece's *post-move* type/color is known directly (fixes
+    // promotion export showing a pawn instead of the promoted piece — this
+    // is exactly what live preview already reads via game.get(to)).
+    const preSnapshot = JSON.parse(JSON.stringify(moveRec.preSnapshot || game.board()));
+    const movingType = moveRec.resultPieceType || 'p';
+    const movingColor = moveRec.color || 'w';
     const from = moveRec.from, to = moveRec.to;
+    const secondary = moveRec.secondary || null; // castling's rook: {from,to,type:'r',color}
+    const extraVacate = moveRec.extraVacate || []; // e.g. en passant's captured-pawn square
 
-    // remove moving piece from the preSnapshot at 'from' so it can be drawn separately
-    (function removeFromSnapshot(){
-      const f = 'abcdefgh'.indexOf(from[0]);
-      const r = 8 - parseInt(from[1]);
-      if(preSnapshot[r] && preSnapshot[r][f]) preSnapshot[r][f] = null;
+    // Vacate every square that must NOT show a static piece during the
+    // animation: the primary piece's origin, the secondary (rook) piece's
+    // origin when castling, and any extra squares (en passant's captured
+    // pawn square, which is not the destination square). A plain capture
+    // needs no special handling here — the captured piece sits at `to` and
+    // is naturally covered once the arriving piece is drawn there.
+    (function vacateSquares(){
+      const squares = [from].concat(secondary ? [secondary.from] : []).concat(extraVacate);
+      for(const sqName of squares){
+        const f = 'abcdefgh'.indexOf(sqName[0]);
+        const r = 8 - parseInt(sqName[1]);
+        if(preSnapshot[r] && preSnapshot[r][f]) preSnapshot[r][f] = null;
+      }
     })();
 
     // compute centers
     const startCenter = squareCenter(from);
     const endCenter = squareCenter(to);
+    const secondaryStartCenter = secondary ? squareCenter(secondary.from) : null;
+    const secondaryEndCenter = secondary ? squareCenter(secondary.to) : null;
 
     // -------------------------------------------------
     // --- START FINAL FIX (Padding + Context) ---
@@ -1178,24 +1306,29 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
 
     // PADDING FIX: Use 0.5 for margin as requested
     const margin = LOGICAL_SIZE/8 * 0.5; // "half square" padding
-    const minX = Math.min(startCenter.x, endCenter.x) - margin;
-    const maxX = Math.max(startCenter.x, endCenter.x) + margin;
-    const minY = Math.min(startCenter.y, endCenter.y) - margin;
-    const maxY = Math.max(startCenter.y, endCenter.y) + margin;
+    // Bounding box covers the primary piece's path, and — for castling —
+    // the rook's path too, so the rook is never animating outside the
+    // cropped frame.
+    const boxXs = [startCenter.x, endCenter.x].concat(secondary ? [secondaryStartCenter.x, secondaryEndCenter.x] : []);
+    const boxYs = [startCenter.y, endCenter.y].concat(secondary ? [secondaryStartCenter.y, secondaryEndCenter.y] : []);
+    const minX = Math.min(...boxXs) - margin;
+    const maxX = Math.max(...boxXs) + margin;
+    const minY = Math.min(...boxYs) - margin;
+    const maxY = Math.max(...boxYs) + margin;
 
     let boxW = Math.min(LOGICAL_SIZE, Math.max(120, maxX - minX));
     let boxH = Math.min(LOGICAL_SIZE, Math.max(120, maxY - minY));
-    
+
     // make square crop (export square) by expanding
     const boxSize = Math.min(LOGICAL_SIZE, Math.max(boxW, boxH));
-    
+
     // center
     const boxCX = (minX + maxX)/2;
     const boxCY = (minY + maxY)/2;
     // compute crop coordinates (clamped)
     let cropX = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, boxCX - boxSize/2));
     let cropY = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, boxCY - boxSize/2));
-    
+
     // --- CONTEXT FIX: These functions are now restored ---
     // These functions are helpers *inside* exportLastMoveAsWebM
     function drawPiecesFromSnapshotTo(targetCtx, snapshot){
@@ -1297,6 +1430,30 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
       }
     }
 
+    // Draws one moving piece (image, or glyph fallback) onto the temp
+    // canvas at the given computed state. Factored out so castling can call
+    // it twice per frame (king + rook) without duplicating this block.
+    function drawMovingPieceToTemp(color, type, state){
+      if(pieceImages[color] && pieceImages[color][type] && pieceImages[color][type].complete){
+        const img = pieceImages[color][type];
+        const s = LOGICAL_SIZE/8;
+        const w = s * PIECE_SCALE * state.scale, h = s * PIECE_SCALE * state.scale;
+        tctx.save();
+        tctx.translate(state.x, state.y);
+        tctx.rotate(state.angle);
+        tctx.drawImage(img, -w/2, -h/2, w, h);
+        tctx.restore();
+      } else {
+        // (Original glyph fallback)
+        tctx.save();
+        tctx.font = Math.floor((LOGICAL_SIZE/8)*PIECE_SCALE) + 'px serif';
+        tctx.textAlign='center'; tctx.textBaseline='middle';
+        tctx.fillStyle = (color==='w' ? '#fff' : '#000');
+        tctx.fillText(glyphFor(type,color), state.x, state.y);
+        tctx.restore();
+      }
+    }
+
     // prepare MediaRecorder with alpha if supported
     let mime = 'video/webm;codecs=vp9';
     const stream = exportCanvas.captureStream(fps);
@@ -1348,37 +1505,31 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
       // 1. Draw the board, static pieces, and overlays
       drawBoardToTemp();
 
-      // 2. Compute moving piece state at t
+      // 2. Compute moving piece state at t, and the secondary (rook) piece's
+      //    state too when castling — same computePieceState() math, just
+      //    called a second time with the rook's own start/end/type.
       const state = computePieceState(movingType, startCenter, endCenter, t);
-      
-      // 3. Draw *ONLY* the moving piece on top of the context
-      if(pieceImages[movingColor] && pieceImages[movingColor][movingType] && pieceImages[movingColor][movingType].complete){
-        const img = pieceImages[movingColor][movingType];
-        const s = LOGICAL_SIZE/8;
-        const w = s * PIECE_SCALE * state.scale, h = s * PIECE_SCALE * state.scale;
-        tctx.save();
-        tctx.translate(state.x, state.y);
-        tctx.rotate(state.angle);
-        tctx.drawImage(img, -w/2, -h/2, w, h);
-        tctx.restore();
-      } else {
-        // (Original glyph fallback)
-        tctx.save();
-        tctx.font = Math.floor((LOGICAL_SIZE/8)*PIECE_SCALE) + 'px serif';
-        tctx.textAlign='center'; tctx.textBaseline='middle';
-        tctx.fillStyle = (movingColor==='w' ? '#fff' : '#000');
-        tctx.fillText(glyphFor(movingType,movingColor), state.x, state.y);
-        tctx.restore();
+      let secondaryState = null;
+      if(secondary){
+        secondaryState = computePieceState(secondary.type, secondaryStartCenter, secondaryEndCenter, t);
+      }
+
+      // 3. Draw the moving piece(s) on top of the context
+      drawMovingPieceToTemp(movingColor, movingType, state);
+      if(secondary){
+        drawMovingPieceToTemp(secondary.color, secondary.type, secondaryState);
       }
 
       // -------------------------------------------------
       // --- END RENDER LOOP ---
       // -------------------------------------------------
 
-      // 4. Compute dynamic camera center following piece (lerp from start->end)
-      const camX = startCenter.x + (endCenter.x - startCenter.x) * t;
-      const camY = startCenter.y + (endCenter.y - startCenter.y) * t;
-      
+      // 4. Compute dynamic camera center following the piece (lerp from
+      //    start->end); for castling, follow the midpoint of both pieces so
+      //    king and rook both stay framed throughout.
+      const camX = secondary ? (state.x + secondaryState.x)/2 : startCenter.x + (endCenter.x - startCenter.x) * t;
+      const camY = secondary ? (state.y + secondaryState.y)/2 : startCenter.y + (endCenter.y - startCenter.y) * t;
+
       // Compute crop (ensure crop fits inside board)
       const half = boxSize / 2;
       let sx = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, camX - half));
