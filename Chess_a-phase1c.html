@@ -1517,8 +1517,7 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
   try {
     const fps = opts.fps || EXPORT_FPS;
     const duration = opts.duration || ANIM_DURATION_MS;
-    const frameCount = Math.max(1, Math.round((duration/1000) * fps));
-    
+
     // temp canvas for drawing logical-size frames
     const temp = document.createElement('canvas'); temp.width = LOGICAL_SIZE; temp.height = LOGICAL_SIZE;
     const tctx = temp.getContext('2d', {alpha:true});
@@ -1727,9 +1726,45 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
       }
     }
 
+    // ---------------- EXPORT TIMING (Phase 4) ----------------
+    // Previously: captureStream(fps) (an internal fixed-rate auto-sampler
+    // that grabs whatever is currently on the canvas on its own clock) fed
+    // by setInterval(fn, intervalMs) with a naive frameIndex++ counter that
+    // assumed every tick landed exactly intervalMs apart. Under any main-
+    // thread jank, setInterval ticks can fire late or get coalesced, which
+    // both (a) desyncs frameIndex-based `t` from real elapsed time and
+    // (b) lets the auto-sampler capture a stale/duplicate frame if a tick
+    // fires late.
+    //
+    // Fix: use captureStream(0) — the standard "manual" capture mode where
+    // NO frame is captured automatically; we push each one explicitly via
+    // CanvasCaptureMediaStreamTrack.requestFrame() the instant it's drawn,
+    // so every captured frame is guaranteed fresh, never stale/duplicated.
+    // Pacing comes from requestAnimationFrame with `t` computed from actual
+    // elapsed wall-clock time (performance.now()) — exactly the same
+    // pattern the live animation curves (animPawn/animRook/etc.) already
+    // use — instead of assuming uniform timer ticks. This is standard,
+    // well-supported Chrome API surface (no invented/manual frame-
+    // injection mechanism); MediaRecorder is still an inherently real-time
+    // recorder, so a ~duration-long export still takes ~duration of wall
+    // time to produce — that's a property of MediaRecorder itself, not
+    // something a different timing mechanism can avoid.
+    //
+    // Feature-detected: if requestFrame() isn't available (very old
+    // Chrome), falls back to the previous fixed-rate auto-sampling so
+    // export still works, just without the stale-frame guarantee.
+    let stream = null, track = null, canRequestFrame = false;
+    try {
+      const probe = exportCanvas.captureStream(0);
+      const probeTrack = probe.getVideoTracks()[0];
+      if(probeTrack && typeof probeTrack.requestFrame === 'function'){
+        stream = probe; track = probeTrack; canRequestFrame = true;
+      }
+    } catch(e){ /* fall through to auto-rate capture below */ }
+    if(!stream){ stream = exportCanvas.captureStream(fps); }
+
     // prepare MediaRecorder with alpha if supported
     let mime = 'video/webm;codecs=vp9';
-    const stream = exportCanvas.captureStream(fps);
     let recorder;
     try { recorder = new MediaRecorder(stream, {mimeType: mime}); }
     catch(e){
@@ -1756,7 +1791,7 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
       a.click();
       a.remove();
       setTimeout(()=>{ URL.revokeObjectURL(url); }, 2000);
-      
+
       showMessage('Export complete!', 'success');
     };
 
@@ -1764,17 +1799,24 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
     recorder.start();
     showMessage('Recording... Please wait.', 'success', duration + 500);
 
-    // Produce frames
-    let frameIndex = 0;
-    const intervalMs = Math.round(1000 / fps);
-    
-    const timer = setInterval(()=>{
-      const t = Math.min(1, frameIndex / Math.max(1, frameCount - 1));
-      
+    // Produce frames: one rendered+pushed frame per requestAnimationFrame
+    // tick, throttled to ~fps (via minFrameIntervalMs) so file size/frame
+    // rate stay close to the requested target on high-refresh-rate
+    // displays, but `t` itself always reflects true elapsed time.
+    const minFrameIntervalMs = 1000 / fps;
+    const t0 = performance.now();
+    let lastPushedAt = -Infinity;
+    let finished = false;
+
+    function frameStep(now){
+      if(finished) return;
+      const elapsed = now - t0;
+      const t = Math.min(1, elapsed / duration);
+
       // -------------------------------------------------
       // --- START RENDER LOOP (with Context) ---
       // -------------------------------------------------
-      
+
       // 1. Draw the board, static pieces, and overlays
       drawBoardToTemp();
 
@@ -1807,18 +1849,27 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
       const half = boxSize / 2;
       let sx = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, camX - half));
       let sy = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, camY - half));
-      
+
       // 5. Draw cropped region from temp (transparent) canvas to final (export) canvas
       ectx.clearRect(0,0,EXPORT_SIZE,EXPORT_SIZE);
       ectx.drawImage(temp, sx, sy, boxSize, boxSize, 0, 0, EXPORT_SIZE, EXPORT_SIZE);
 
-      frameIndex++;
-      if(frameIndex >= frameCount){
-        clearInterval(timer);
-        // tiny extra frame before stopping to stabilize
+      // 6. Push exactly this frame into the capture stream (manual mode
+      //    only — the auto-rate fallback captures on its own clock).
+      if(canRequestFrame && (now - lastPushedAt >= minFrameIntervalMs || t >= 1)){
+        track.requestFrame();
+        lastPushedAt = now;
+      }
+
+      if(t < 1){
+        requestAnimationFrame(frameStep);
+      } else {
+        finished = true;
+        // tiny extra delay before stopping so the final frame is flushed/stable
         setTimeout(()=>{ recorder.stop(); }, 80);
       }
-    }, intervalMs);
+    }
+    requestAnimationFrame(frameStep);
   } catch (err) {
     console.error("Export failed:", err);
     showMessage("Export failed! See console for error.", "error");
