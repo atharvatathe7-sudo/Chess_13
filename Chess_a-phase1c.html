@@ -344,7 +344,12 @@ const LOGICAL_SIZE = 600;
 const PIECE_SCALE = 1.08;      // (from Chess_l.html)
 const ANIM_DURATION_MS = 1500; // (from Chess_l.html)
 const EXPORT_FPS = 30;         // (from Chess_l.html)
-const EXPORT_SIZE = 720;       // (from Chess_l.html)
+const EXPORT_SIZE = 1080;      // 1080-class square export (was 720 — too low for a YouTube-bound source clip)
+// The export's working canvas is rendered at LOGICAL_SIZE * EXPORT_RENDER_SCALE
+// physical pixels (independent of the live on-screen board's resolution),
+// so cropping into a tight cinematic frame doesn't upscale an
+// already-low-resolution source — see exportLastMoveAsWebM().
+const EXPORT_RENDER_SCALE = 4;
 
 /* ---------------- DOM ---------------- */
 const boardCanvas = document.getElementById('boardCanvas');
@@ -666,6 +671,9 @@ function redrawOverlay(){
     const to = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
     drawArrow(octx, from, to, a.color, Math.max(4, LOGICAL_SIZE*0.01));
   }
+  if(activeRec && activeRec.badge){
+    drawBadgeAt(octx, activeRec.to, activeRec.badge);
+  }
   if(selectedSquare){
     const c = squareToCoords(selectedSquare);
     octx.fillStyle = 'rgba(20, 200, 20, 0.5)'; // NEW: Brighter selection
@@ -701,6 +709,35 @@ function drawArrow(ctxA, from, to, color, width=6){
   ctxA.lineTo(to.x - head*Math.cos(ang + Math.PI/6), to.y - head*Math.sin(ang + Math.PI/6));
   ctxA.closePath(); ctxA.fill();
   ctxA.globalAlpha = 1.0;
+}
+
+// Draws a move's badge (e.g. "!!", "?!", "#") as a small chip pinned to the
+// top-right corner of its destination square. Previously badges were only
+// ever shown as text in the side-panel timeline list — never on the board
+// itself, live or exported — which is why they had no visible effect on
+// the cinematic output. This is the single shared implementation used by
+// both redrawOverlay() (live) and the export's drawOverlayElementsToTemp(),
+// so a badge always looks identical in preview and export. squareCenter()
+// is flip-aware, so this respects board orientation automatically.
+function drawBadgeAt(targetCtx, sq, badge){
+  if(!badge) return;
+  const s = LOGICAL_SIZE/8;
+  const c = squareCenter(sq);
+  const r = s*0.22;
+  const bx = c.x + s*0.34, by = c.y - s*0.34;
+  targetCtx.save();
+  targetCtx.beginPath();
+  targetCtx.arc(bx, by, r, 0, Math.PI*2);
+  targetCtx.fillStyle = '#1a0433';
+  targetCtx.fill();
+  targetCtx.lineWidth = Math.max(2, s*0.035);
+  targetCtx.strokeStyle = '#ffffff';
+  targetCtx.stroke();
+  targetCtx.fillStyle = '#ffffff';
+  targetCtx.font = `bold ${Math.floor(s*0.24)}px Inter, system-ui, sans-serif`;
+  targetCtx.textAlign = 'center'; targetCtx.textBaseline = 'middle';
+  targetCtx.fillText(badge, bx, by + 1);
+  targetCtx.restore();
 }
 
 /* ---------------- COORD HELPERS (MODIFIED for Pan/Zoom) ---------------- */
@@ -1224,6 +1261,24 @@ function animateMoveByPiece(from,to,type,color,durationMs,onComplete){
 // per-piece-type curves above — for castling it just runs the king's and
 // rook's animations in parallel, using the existing rook curve for the
 // rook, rather than introducing any new animation system.
+// A longer move covers more visual distance in the same wall-clock time,
+// which makes it read as rushed/incomplete even though the code timing is
+// identical to a short move. Scales ANIM_DURATION_MS modestly for moves
+// beyond ~2 squares of travel (capped), so a queen crossing the board gets
+// meaningfully more time to be readable without slowing down the common
+// short-move case at all. Shared by live preview (animateRecord, below)
+// AND export, so both stay on the same timing concept — see
+// exportLastMoveAsWebM(), which calls this too when no explicit duration
+// is supplied.
+function computeMoveDuration(record, baseDuration){
+  baseDuration = baseDuration || ANIM_DURATION_MS;
+  const start = squareCenter(record.from), end = squareCenter(record.to);
+  const travelSquares = Math.hypot(end.x - start.x, end.y - start.y) / (LOGICAL_SIZE/8);
+  const BASE_SQUARES = 2, EXTRA_MS_PER_SQUARE = 120, MAX_DURATION_MS = 2600;
+  const scaled = baseDuration + Math.max(0, travelSquares - BASE_SQUARES) * EXTRA_MS_PER_SQUARE;
+  return Math.round(Math.min(MAX_DURATION_MS, Math.max(baseDuration, scaled)));
+}
+
 function animateRecord(record, onComplete){
   if(!record){ if(onComplete) onComplete(); return; }
   const toHide = record.secondary ? [record.to, record.secondary.to] : [record.to];
@@ -1238,9 +1293,10 @@ function animateRecord(record, onComplete){
     }
   }
 
-  animateMoveByPiece(record.from, record.to, record.resultPieceType, record.color, ANIM_DURATION_MS, settle);
+  const dur = computeMoveDuration(record);
+  animateMoveByPiece(record.from, record.to, record.resultPieceType, record.color, dur, settle);
   if(record.secondary){
-    animateMoveByPiece(record.secondary.from, record.secondary.to, record.secondary.type, record.secondary.color, ANIM_DURATION_MS, settle);
+    animateMoveByPiece(record.secondary.from, record.secondary.to, record.secondary.type, record.secondary.color, dur, settle);
   }
 }
 
@@ -1330,7 +1386,7 @@ document.getElementById('flip').addEventListener('click', ()=>{ boardFlipped = !
 // one is selected, else the latest move (getActiveRecord()'s default) —
 // so previewing/exporting an older move works exactly like the latest one.
 document.getElementById('playAnim').addEventListener('click', ()=>{ const rec = getActiveRecord(); if(rec) playRecordAnimation(rec, ()=>{ updateHistory(); updateStatus(); }); });
-document.getElementById('exportAnim').addEventListener('click', ()=>{ const rec = getActiveRecord(); if(!rec){ showMessage('Make a move first (drag a piece). Export records the selected move.', 'error'); return; } exportLastMoveAsWebM(rec, {fps: EXPORT_FPS, duration: ANIM_DURATION_MS}); });
+document.getElementById('exportAnim').addEventListener('click', ()=>{ const rec = getActiveRecord(); if(!rec){ showMessage('Make a move first (drag a piece). Export records the selected move.', 'error'); return; } exportLastMoveAsWebM(rec, {fps: EXPORT_FPS}); });
 const removeBtn = document.getElementById('removeToggle'); removeBtn.addEventListener('click', ()=>{ removeMode = !removeMode; removeBtn.classList.toggle('active', removeMode); removeBtn.textContent = removeMode ? 'Remove: ON' : 'Remove Piece'; });
 document.getElementById('clearAll').addEventListener('click', ()=>{ const rec=getActiveRecord(); if(rec){ rec.arrows=[]; rec.highlights=[]; } redrawOverlay(); updateHistory(); });
 
@@ -1341,7 +1397,7 @@ document.getElementById('backToLive').addEventListener('click', ()=>{ if(history
 // computes, verifies, or suggests them. Written straight onto the active
 // move record (never a global), so they never leak to another move.
 document.getElementById('annotationSelect').addEventListener('change', (e)=>{ const rec = getActiveRecord(); if(rec){ rec.annotation = e.target.value; updateTimeline(); } });
-document.getElementById('badgeSelect').addEventListener('change', (e)=>{ const rec = getActiveRecord(); if(rec){ rec.badge = e.target.value; updateTimeline(); } });
+document.getElementById('badgeSelect').addEventListener('change', (e)=>{ const rec = getActiveRecord(); if(rec){ rec.badge = e.target.value; updateTimeline(); redrawOverlay(); } });
 
 /* ---------------- TIMELINE + ANNOTATION UI (Phase 3) ---------------- */
 // Renders only the current active line (plies 1..historyPointer) as
@@ -1513,15 +1569,26 @@ function animateTransform(from,to,dur){
    on a transparent background.
    THE TYPO 'LOGICAL_GSIZE' IS FIXED.
 */
-function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURATION_MS}){
+function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
   try {
     const fps = opts.fps || EXPORT_FPS;
-    const duration = opts.duration || ANIM_DURATION_MS;
 
-    // temp canvas for drawing logical-size frames
-    const temp = document.createElement('canvas'); temp.width = LOGICAL_SIZE; temp.height = LOGICAL_SIZE;
+    // temp canvas for drawing frames — rendered at EXPORT_RENDER_SCALE times
+    // LOGICAL_SIZE (physical pixels), independent of the live on-screen
+    // board's resolution, so cropping into a tight cinematic frame doesn't
+    // upscale an already-low-resolution source (the previous 600x600
+    // working canvas, cropped down to e.g. 120x120 for a tight shot and
+    // then stretched up to fill a 720x720 export, was exactly that — a
+    // ~6x upscale of already-rasterized pixels). All existing drawing code
+    // below still works in the same 0..LOGICAL_SIZE coordinate space
+    // unchanged; the scale transform on tctx (right below) is what makes it
+    // render at higher physical resolution.
+    const temp = document.createElement('canvas');
+    temp.width = LOGICAL_SIZE * EXPORT_RENDER_SCALE;
+    temp.height = LOGICAL_SIZE * EXPORT_RENDER_SCALE;
     const tctx = temp.getContext('2d', {alpha:true});
-    
+    tctx.scale(EXPORT_RENDER_SCALE, EXPORT_RENDER_SCALE);
+
     // export canvas square (with alpha)
     const exportCanvas = document.createElement('canvas'); exportCanvas.width = EXPORT_SIZE; exportCanvas.height = EXPORT_SIZE;
     const ectx = exportCanvas.getContext('2d', {alpha:true});
@@ -1557,23 +1624,42 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
     const secondaryStartCenter = secondary ? squareCenter(secondary.from) : null;
     const secondaryEndCenter = secondary ? squareCenter(secondary.to) : null;
 
+    // Distance-scaled duration — see computeMoveDuration() (shared with
+    // live preview's animateRecord()), unless the caller explicitly
+    // overrides it via opts.duration.
+    const duration = opts.duration || computeMoveDuration(moveRec);
+
     // -------------------------------------------------
     // --- START FINAL FIX (Padding + Context) ---
     // -------------------------------------------------
 
     // PADDING FIX: Use 0.5 for margin as requested
     const margin = LOGICAL_SIZE/8 * 0.5; // "half square" padding
-    // Bounding box covers the primary piece's path, the rook's path when
-    // castling (so it's never animating outside the cropped frame), AND
-    // every currently-active arrow/highlight (drawOverlayElementsToTemp
-    // below already renders these into the export — this just makes sure
-    // the crop doesn't clip them when they extend past the move itself,
-    // e.g. an arrow from a1->h8 while the move is e2-e4). squareCenter()
-    // is reused so these points are already flip-aware, exactly matching
-    // how the annotations themselves are drawn.
-    const boxXs = [startCenter.x, endCenter.x];
-    const boxYs = [startCenter.y, endCenter.y];
-    if(secondary){ boxXs.push(secondaryStartCenter.x, secondaryEndCenter.x); boxYs.push(secondaryStartCenter.y, secondaryEndCenter.y); }
+    // Bounding box covers the FULL piece trajectory — not just the start/end
+    // squares. The animation curves (computePieceState, below — knight's
+    // arc, bishop/queen's bezier bulge) travel visibly outside the straight
+    // line between origin and destination, so a box built only from those
+    // two points was clipping the curve itself (most visible on knight/
+    // bishop/medium queen moves: exactly the "tight/restricted" framing
+    // reported). Sampling the actual curve at several t steps — the same
+    // function used to draw every frame — guarantees the crop always
+    // contains what's actually rendered, for every piece type, without
+    // hardcoding a fixed size. Also includes every currently-active arrow/
+    // highlight (drawOverlayElementsToTemp below renders these into the
+    // export; this keeps the crop from clipping them when they extend past
+    // the move itself, e.g. an arrow from a1->h8 while the move is e2-e4).
+    // squareCenter() is flip-aware, matching how everything is drawn.
+    const boxXs = [];
+    const boxYs = [];
+    const TRAJECTORY_SAMPLES = 12;
+    function addTrajectorySamples(type, start, end){
+      for(let i=0;i<=TRAJECTORY_SAMPLES;i++){
+        const st = computePieceState(type, start, end, i/TRAJECTORY_SAMPLES);
+        boxXs.push(st.x); boxYs.push(st.y);
+      }
+    }
+    addTrajectorySamples(movingType, startCenter, endCenter);
+    if(secondary){ addTrajectorySamples(secondary.type, secondaryStartCenter, secondaryEndCenter); }
     for(const h of recHighlights){
       const hc = squareCenter(h.sq);
       boxXs.push(hc.x); boxYs.push(hc.y);
@@ -1640,6 +1726,11 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
         const from = squareCenter(a.from);
         const to = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
         drawArrow(targetCtx, from, to, a.color, Math.max(4, LOGICAL_SIZE*0.01));
+      }
+      // Badge (Phase 5): same shared drawBadgeAt() live preview uses, so it
+      // looks identical in export — see redrawOverlay().
+      if(moveRec.badge){
+        drawBadgeAt(targetCtx, moveRec.to, moveRec.badge);
       }
     }
 
@@ -1763,15 +1854,24 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
     } catch(e){ /* fall through to auto-rate capture below */ }
     if(!stream){ stream = exportCanvas.captureStream(fps); }
 
-    // prepare MediaRecorder with alpha if supported
+    // prepare MediaRecorder with alpha if supported. An explicit
+    // videoBitsPerSecond is required here — without it Chrome's own default
+    // bitrate heuristic for a captureStream() source is conservative and
+    // visibly soft even at 1080p, which was the other half of the reported
+    // "360p/480p-looking" quality problem (resolution alone isn't enough;
+    // a high-res frame encoded at a low bitrate still looks blurry). 12Mbps
+    // is a generous "editing source" target for a ~1080x1080 clip a few
+    // seconds long (a few MB per export) — this is meant to be re-compressed
+    // by the user's editor and then YouTube, not a final delivery file.
+    const EXPORT_BITRATE = 12_000_000;
     let mime = 'video/webm;codecs=vp9';
     let recorder;
-    try { recorder = new MediaRecorder(stream, {mimeType: mime}); }
+    try { recorder = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: EXPORT_BITRATE}); }
     catch(e){
       console.warn("VP9 with alpha not supported, falling back.");
       mime = 'video/webm';
       try {
-        recorder = new MediaRecorder(stream, {mimeType: mime});
+        recorder = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: EXPORT_BITRATE});
       } catch (e2) {
         showMessage("Video recording is not supported on this browser.", "error");
         return;
@@ -1804,12 +1904,22 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
     // rate stay close to the requested target on high-refresh-rate
     // displays, but `t` itself always reflects true elapsed time.
     const minFrameIntervalMs = 1000 / fps;
-    const t0 = performance.now();
+    // t0 is anchored to the FIRST rAF callback's own timestamp (captured
+    // lazily below), not a performance.now() call made before registering
+    // it. If the browser is briefly busy between that registration and the
+    // first callback actually firing (layout/GC/scheduling — plausible
+    // right after the drag-drop interaction that triggered this export),
+    // an eagerly-captured t0 could already be "behind" by the time the
+    // first frame runs, making elapsed>=duration on frame 1 and collapsing
+    // the whole export to a single frame. Anchoring to the first real tick
+    // makes elapsed exactly 0 on that frame regardless of any such delay.
+    let t0 = null;
     let lastPushedAt = -Infinity;
     let finished = false;
 
     function frameStep(now){
       if(finished) return;
+      if(t0 === null) t0 = now;
       const elapsed = now - t0;
       const t = Math.min(1, elapsed / duration);
 
@@ -1839,20 +1949,36 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
       // --- END RENDER LOOP ---
       // -------------------------------------------------
 
-      // 4. Compute dynamic camera center following the piece (lerp from
-      //    start->end); for castling, follow the midpoint of both pieces so
-      //    king and rook both stay framed throughout.
-      const camX = secondary ? (state.x + secondaryState.x)/2 : startCenter.x + (endCenter.x - startCenter.x) * t;
-      const camY = secondary ? (state.y + secondaryState.y)/2 : startCenter.y + (endCenter.y - startCenter.y) * t;
+      // 4. Compute dynamic camera center following the piece's ACTUAL
+      //    rendered position (state.x/y — the same curved point just drawn
+      //    in step 3), not a straight-line lerp from start->end. The old
+      //    straight-line camera could drift away from where the piece
+      //    genuinely is on a curved path (knight/bishop/queen), which,
+      //    combined with a too-tight box, could let the piece visibly slip
+      //    toward the edge of frame mid-flight. For castling, follow the
+      //    midpoint of both pieces' actual positions so king and rook stay
+      //    framed throughout.
+      const camX = secondary ? (state.x + secondaryState.x)/2 : state.x;
+      const camY = secondary ? (state.y + secondaryState.y)/2 : state.y;
 
       // Compute crop (ensure crop fits inside board)
       const half = boxSize / 2;
       let sx = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, camX - half));
       let sy = Math.max(0, Math.min(LOGICAL_SIZE - boxSize, camY - half));
 
-      // 5. Draw cropped region from temp (transparent) canvas to final (export) canvas
+      // 5. Draw cropped region from temp (transparent) canvas to final
+      //    (export) canvas. sx/sy/boxSize are in the 0..LOGICAL_SIZE
+      //    logical space; temp's PHYSICAL pixels are EXPORT_RENDER_SCALE
+      //    times larger (see temp.width/height above), so the source rect
+      //    passed to drawImage must be scaled up to match — drawImage's
+      //    9-argument form reads the source rectangle in the source
+      //    canvas's actual physical pixels, not through its transform.
       ectx.clearRect(0,0,EXPORT_SIZE,EXPORT_SIZE);
-      ectx.drawImage(temp, sx, sy, boxSize, boxSize, 0, 0, EXPORT_SIZE, EXPORT_SIZE);
+      ectx.drawImage(
+        temp,
+        sx*EXPORT_RENDER_SCALE, sy*EXPORT_RENDER_SCALE, boxSize*EXPORT_RENDER_SCALE, boxSize*EXPORT_RENDER_SCALE,
+        0, 0, EXPORT_SIZE, EXPORT_SIZE
+      );
 
       // 6. Push exactly this frame into the capture stream (manual mode
       //    only — the auto-rate fallback captures on its own clock).
