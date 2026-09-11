@@ -271,10 +271,46 @@ button:active, button.active {
         </div>
 
         <div style="margin-top:8px">
+          <label class="small">Move Timeline</label>
+          <div class="history" id="timelineList"></div>
+        </div>
+
+        <div class="row" style="flex-wrap:wrap;margin-top:4px;">
+          <span class="small" id="selectedMoveLabel">No move selected</span>
+          <button id="backToLive" style="padding:4px 8px;">Live</button>
+        </div>
+        <div class="row" style="flex-wrap:wrap;">
+          <label class="small">Annotation</label>
+          <select id="annotationSelect">
+            <option value="">(none)</option>
+            <option value="Brilliant">Brilliant</option>
+            <option value="Best">Best</option>
+            <option value="Good">Good</option>
+            <option value="Book">Book</option>
+            <option value="Inaccuracy">Inaccuracy</option>
+            <option value="Mistake">Mistake</option>
+            <option value="Blunder">Blunder</option>
+            <option value="Check">Check</option>
+            <option value="Checkmate">Checkmate</option>
+          </select>
+          <label class="small">Badge</label>
+          <select id="badgeSelect">
+            <option value="">(none)</option>
+            <option value="!!">!!</option>
+            <option value="!?">!?</option>
+            <option value="?!">?!</option>
+            <option value="?">?</option>
+            <option value="??">??</option>
+            <option value="#">#</option>
+          </select>
+        </div>
+
+        <div style="margin-top:8px">
           <label class="small">Notes (for export)</label>
           <textarea id="notes" style="width:100%;box-sizing: border-box;height:64px;"></textarea>
         </div>
 
+        <label class="small">Arrows / Highlights (selected move)</label>
         <div class="history" id="historyList"></div>
         <div class="hotkeys">Hotkeys: M=Move, A=Arrow, H=Highlight, C=Clear, F=Flip. Space = Play.</div>
       </div>
@@ -328,18 +364,29 @@ const promotionBox = document.getElementById('promotion-box');
 
 /* ---------------- STATE ---------------- */
 let game = null;
-let arrows = [], highlights = [];
 let selectedSquare = null;
 let dragging = null;
 let boardFlipped = false;
 let removeMode = false;
 // Per-ply move history (undo/redo without replacing chess.js, and a single
 // rich record per move that live animation and export both read from — see
-// buildMoveRecord() and syncTransientMoveState() below).
+// buildMoveRecord() and syncTransientMoveState() below). Arrows/highlights
+// live on each record (record.arrows / record.highlights) instead of in a
+// global array — see getActiveRecord() — so they're move-scoped rather than
+// shown/exported on every move regardless of which move they were drawn for.
 let moveHistory = []; // append-only move records
 let historyPointer = 0; // moveHistory[0..historyPointer-1] are currently applied to `game`
 let lastMoveRecord = null; // always mirrors moveHistory[historyPointer-1], or null at the start position
 let animHideSquares = new Set(); // squares whose pieces are mid-flight (hide the static copy); a Set so castling can hide both the king's and rook's destination squares at once
+
+// NEW (Phase 3): timeline selection + read-only historical preview.
+// selectedPly is the ply (1-based) whose record is the current "active"
+// annotation/preview/export context — see getActiveRecord(). previewBoard,
+// when non-null, is a board() snapshot that drawPieces() renders INSTEAD of
+// the live game.board() — used only to browse/animate a historical (not the
+// latest) move without touching `game`/`historyPointer` at all.
+let selectedPly = null;
+let previewBoard = null;
 const pieceTypes = ['k','q','r','b','n','p'];
 const pieceImages = { w: {}, b: {} };
 const PIECE_LOAD_TIMEOUT = 1200;
@@ -554,7 +601,10 @@ function drawBoard(){
 
 function drawPieces(){
   const s = LOGICAL_SIZE/8;
-  const b = game.board();
+  // previewBoard (set only while browsing/animating a historical, non-live
+  // move — see selectMove()/playRecordAnimation()) overrides the live game
+  // position for rendering, without ever touching `game` itself.
+  const b = previewBoard || game.board();
   for(let r=0;r<8;r++){
     for(let f=0;f<8;f++){
       const p = b[r][f];
@@ -601,12 +651,17 @@ function redrawOverlay(){
   octx.scale(viewTransform.scale, viewTransform.scale);
   
   const s = LOGICAL_SIZE/8;
-  for(const h of highlights){
+  // Move-scoped: only the active record's (selected, or latest-move-by-
+  // default) arrows/highlights are shown — see getActiveRecord().
+  const activeRec = getActiveRecord();
+  const activeHighlights = activeRec ? activeRec.highlights : [];
+  const activeArrows = activeRec ? activeRec.arrows : [];
+  for(const h of activeHighlights){
     const visFile = boardFlipped ? (7 - h.file) : h.file;
     const visRank = boardFlipped ? (7 - h.rank) : h.rank;
     octx.fillStyle = h.color; octx.globalAlpha = h.alpha; octx.fillRect(visFile*s+4, visRank*s+4, s-8, s-8); octx.globalAlpha = 1;
   }
-  for(const a of arrows){
+  for(const a of activeArrows){
     const from = squareCenter(a.from);
     const to = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
     drawArrow(octx, from, to, a.color, Math.max(4, LOGICAL_SIZE*0.01));
@@ -743,25 +798,32 @@ function onDown(e){
     arrowTemp = {from: sq, start: p}; 
     return; 
   }
-  if(currentMode === 'highlight'){ 
+  if(currentMode === 'highlight'){
     isPanning = false; isPinching = false; dragging = null;
-    if(!sq) return; 
-    highlights.push({file:'abcdefgh'.indexOf(sq[0]), rank:8-parseInt(sq[1],10), sq: sq, color: hexToRgba(document.getElementById('color').value,1), alpha:0.28}); 
-    redrawOverlay(); 
-    updateHistory(); 
-    return; 
+    if(!sq) return;
+    const rec = getActiveRecord();
+    if(!rec){ showMessage('Make a move first to annotate it.', 'error'); return; }
+    rec.highlights.push({file:'abcdefgh'.indexOf(sq[0]), rank:8-parseInt(sq[1],10), sq: sq, color: hexToRgba(document.getElementById('color').value,1), alpha:0.28});
+    redrawOverlay();
+    updateHistory();
+    return;
   }
-  if(removeMode && sq){ 
+  if(removeMode && sq){
     isPanning = false; isPinching = false; dragging = null;
-    try{ game.remove && game.remove(sq); }catch(e){} 
-    drawBoard(); 
-    redrawOverlay(); 
+    if(previewBoard){ showMessage('Viewing a past move — select the latest move to edit the live position.', 'error'); return; }
+    try{ game.remove && game.remove(sq); }catch(e){}
+    drawBoard();
+    redrawOverlay();
     updateHistory();
     updateStatus(); // <-- NEW
-    return; 
+    return;
   }
-  
+
   if(currentMode === 'move'){
+    if(previewBoard){
+      showMessage('Viewing a past move — select the latest move to continue playing.', 'error');
+      return;
+    }
     const piece = sq ? game.get(sq) : null;
     if(!piece) {
         // START PAN — disabled: one-finger panning from empty space is no longer allowed.
@@ -901,13 +963,14 @@ function onUp(e){
 
   const p = getCanvasPos(e); const sq = posToSquare(p.x,p.y);
   
-  if(arrowTemp){ 
-    if(sq && sq !== arrowTemp.from){ 
-        arrows.push({from: arrowTemp.from, to: sq, color: document.getElementById('color').value}); 
-        updateHistory(); 
-    } 
-    arrowTemp = null; 
-    redrawOverlay(); 
+  if(arrowTemp){
+    if(sq && sq !== arrowTemp.from){
+        const rec = getActiveRecord();
+        if(rec){ rec.arrows.push({from: arrowTemp.from, to: sq, color: document.getElementById('color').value}); updateHistory(); }
+        else { showMessage('Make a move first to annotate it.', 'error'); }
+    }
+    arrowTemp = null;
+    redrawOverlay();
   }
   
   if(dragging){
@@ -1038,17 +1101,83 @@ function buildMoveRecord(m, from, to, preSnapshot, movingBefore){
     preSnapshot,                      // deep-cloned board() BEFORE this move
     secondary,                        // {from,to,type:'r',color} for castling's rook, else null
     extraVacate,                      // squares beyond `from` that must be cleared for export (e.g. en passant)
-    annotation: '',                   // reserved for a later phase (human-provided)
-    badge: ''                         // reserved for a later phase (human-provided)
+    annotation: '',                   // human-provided (Phase 3): e.g. "Brilliant" — never computed by the app
+    badge: '',                        // human-provided (Phase 3): e.g. "!!" — never computed by the app
+    arrows: [],                       // move-scoped arrows (Phase 3): {from,to,color} — belong to THIS ply only
+    highlights: []                    // move-scoped highlights (Phase 3): {file,rank,sq,color,alpha} — belong to THIS ply only
   };
 }
 
 // Keeps lastMoveRecord/animHideSquares in lockstep with historyPointer so
 // Play Animation / Export can never reference a move that isn't the current
-// position's last move (fixes stale replay/export after undo/redo).
+// position's last move (fixes stale replay/export after undo/redo). Also
+// (Phase 3) resyncs the timeline selection to "the latest move" on every
+// game-state change (new move, undo, redo, reset) and drops any historical
+// preview — so a selection can never point at a move that's been undone
+// past, and the timeline always reflects the actual current history.
 function syncTransientMoveState(){
   animHideSquares.clear();
   lastMoveRecord = historyPointer > 0 ? moveHistory[historyPointer - 1] : null;
+  selectedPly = historyPointer > 0 ? historyPointer : null;
+  previewBoard = null;
+}
+
+/* ---------------- TIMELINE SELECTION (Phase 3) ----------------
+   getActiveRecord() is the single source of truth for "which move is the
+   current annotation/preview/export context" — it's what redrawOverlay(),
+   arrow/highlight creation, the annotation/badge controls, Play Animation
+   and Export all consult. Defaults to the latest move so existing
+   (pre-timeline) behavior is unchanged when the user hasn't selected an
+   older move explicitly.
+*/
+function getActiveRecord(){
+  if(selectedPly && moveHistory[selectedPly - 1]) return moveHistory[selectedPly - 1];
+  if(historyPointer > 0) return moveHistory[historyPointer - 1];
+  return null;
+}
+
+// The board position immediately after `ply`, without touching `game`:
+// for the current live move this is just game.board() (signalled by
+// returning null — drawPieces() falls back to game.board() itself), and
+// for an earlier move it's borrowed from the NEXT record's preSnapshot
+// (that record's "before" is this one's "after") — avoiding storing a
+// second full board snapshot per move.
+function boardAfterPly(ply){
+  if(ply === historyPointer) return null;
+  return moveHistory[ply] ? moveHistory[ply].preSnapshot : null;
+}
+
+// A clone of `record.preSnapshot` with every square that must not show a
+// static piece during that move's animation cleared (the same squares
+// exportLastMoveAsWebM vacates: the mover's origin, castling's rook
+// origin, en passant's captured-pawn square). Shared by the historical
+// preview path (playRecordAnimation) and export, so both start an
+// animation from the identical base state.
+function vacatedSnapshot(record){
+  const snap = JSON.parse(JSON.stringify(record.preSnapshot || game.board()));
+  const squares = [record.from].concat(record.secondary ? [record.secondary.from] : []).concat(record.extraVacate || []);
+  for(const sqName of squares){
+    const f = 'abcdefgh'.indexOf(sqName[0]);
+    const r = 8 - parseInt(sqName[1]);
+    if(snap[r] && snap[r][f]) snap[r][f] = null;
+  }
+  return snap;
+}
+
+// Selects a move from the timeline for annotation/preview/export. Only
+// moves within the CURRENT active line (1..historyPointer) are selectable
+// — deliberately not the undone "redo future" beyond historyPointer, so
+// this never needs to reconstruct a position `game` itself can't also
+// reach by redoing. Never touches `game`/`historyPointer`: selecting a
+// historical move only sets a read-only preview snapshot that drawPieces()
+// renders instead of the live position (see previewBoard above).
+function selectMove(ply){
+  if(ply < 1 || ply > historyPointer) return;
+  selectedPly = ply;
+  previewBoard = boardAfterPly(ply);
+  drawBoard();
+  redrawOverlay();
+  updateHistory(); // also refreshes the timeline + annotation panel, see below
 }
 
 /* ---------------- NEW: Upgraded Promotion UI (using Glyphs) ---------------- */
@@ -1115,6 +1244,25 @@ function animateRecord(record, onComplete){
   }
 }
 
+// Preview entry point used by "Play Animation" (Phase 3): safely animates
+// ANY selected timeline move, not just the live/latest one, by temporarily
+// pointing previewBoard at that move's own before/after snapshots for the
+// duration of the animation — game/historyPointer are never touched. For
+// the live move this is a no-op wrapper (previewBoard stays null
+// throughout, exactly like before Phase 3) since game.board() already IS
+// that move's post-move position.
+function playRecordAnimation(record, onComplete){
+  if(!record){ if(onComplete) onComplete(); return; }
+  const isLive = record.ply === historyPointer;
+  if(!isLive) previewBoard = vacatedSnapshot(record);
+  animateRecord(record, ()=>{
+    if(!isLive) previewBoard = boardAfterPly(record.ply);
+    drawBoard();
+    redrawOverlay();
+    if(onComplete) onComplete();
+  });
+}
+
 /* animation implementations */
 function drawMovingImage(img, x, y, scale=1, angle=0, useOverlay=true){
   const ctxTarget = useOverlay ? octx : ctx;
@@ -1176,18 +1324,107 @@ document.getElementById('redo').addEventListener('click', ()=>{
     updateStatus(); drawBoard(); redrawOverlay(); updateHistory();
   }
 });
-document.getElementById('reset').addEventListener('click', ()=>{ game.reset(); arrows=[]; highlights=[]; selectedSquare=null; moveHistory=[]; historyPointer=0; syncTransientMoveState(); updateStatus(); unzoomSmooth(); drawBoard(); redrawOverlay(); updateHistory(); });
+document.getElementById('reset').addEventListener('click', ()=>{ game.reset(); selectedSquare=null; moveHistory=[]; historyPointer=0; syncTransientMoveState(); updateStatus(); unzoomSmooth(); drawBoard(); redrawOverlay(); updateHistory(); });
 document.getElementById('flip').addEventListener('click', ()=>{ boardFlipped = !boardFlipped; drawBoard(); redrawOverlay(); });
-document.getElementById('playAnim').addEventListener('click', ()=>{ if(lastMoveRecord) animateRecord(lastMoveRecord, ()=>{ drawBoard(); redrawOverlay(); updateHistory(); updateStatus(); }); });
-document.getElementById('exportAnim').addEventListener('click', ()=>{ if(!lastMoveRecord){ showMessage('Make a move first (drag a piece). Export records the last move.', 'error'); return; } exportLastMoveAsWebM(lastMoveRecord, {fps: EXPORT_FPS, duration: ANIM_DURATION_MS}); });
+// Play/Export operate on the ACTIVE record — the selected timeline move if
+// one is selected, else the latest move (getActiveRecord()'s default) —
+// so previewing/exporting an older move works exactly like the latest one.
+document.getElementById('playAnim').addEventListener('click', ()=>{ const rec = getActiveRecord(); if(rec) playRecordAnimation(rec, ()=>{ updateHistory(); updateStatus(); }); });
+document.getElementById('exportAnim').addEventListener('click', ()=>{ const rec = getActiveRecord(); if(!rec){ showMessage('Make a move first (drag a piece). Export records the selected move.', 'error'); return; } exportLastMoveAsWebM(rec, {fps: EXPORT_FPS, duration: ANIM_DURATION_MS}); });
 const removeBtn = document.getElementById('removeToggle'); removeBtn.addEventListener('click', ()=>{ removeMode = !removeMode; removeBtn.classList.toggle('active', removeMode); removeBtn.textContent = removeMode ? 'Remove: ON' : 'Remove Piece'; });
-document.getElementById('clearAll').addEventListener('click', ()=>{ arrows=[]; highlights=[]; redrawOverlay(); updateHistory(); });
+document.getElementById('clearAll').addEventListener('click', ()=>{ const rec=getActiveRecord(); if(rec){ rec.arrows=[]; rec.highlights=[]; } redrawOverlay(); updateHistory(); });
 
-/* history UI (Original) */
-function updateHistory(){ const el=document.getElementById('historyList'); el.innerHTML=''; arrows.forEach((a,i)=>{ const d=document.createElement('div'); d.style.padding='6px'; d.style.borderBottom='1px solid rgba(255,255,255,0.03)'; d.innerHTML=`Arrow ${i+1}: ${a.from} → ${a.to} <button data-i='${i}' style="padding: 2px 5px; font-size: 10px; float: right;">X</button>`; el.appendChild(d); }); highlights.forEach((h,i)=>{ const d=document.createElement('div'); d.style.padding='6px'; d.style.borderBottom='1px solid rgba(255,255,255,0.03)'; d.innerHTML=`Highlight ${i+1}: ${h.sq} <button data-i='h${i}' style="padding: 2px 5px; font-size: 10px; float: right;">X</button>`; el.appendChild(d); }); el.querySelectorAll('button').forEach(b=>{ b.onclick=()=>{ const id=b.dataset.i; if(id.startsWith('h')){ highlights.splice(parseInt(id.slice(1)),1); } else { arrows.splice(parseInt(id),1); } redrawOverlay(); updateHistory(); }; }); }
+// NEW (Phase 3): return the board/annotation context to the live position.
+document.getElementById('backToLive').addEventListener('click', ()=>{ if(historyPointer > 0) selectMove(historyPointer); });
+
+// NEW (Phase 3): annotation/badge are USER choices only — the app never
+// computes, verifies, or suggests them. Written straight onto the active
+// move record (never a global), so they never leak to another move.
+document.getElementById('annotationSelect').addEventListener('change', (e)=>{ const rec = getActiveRecord(); if(rec){ rec.annotation = e.target.value; updateTimeline(); } });
+document.getElementById('badgeSelect').addEventListener('change', (e)=>{ const rec = getActiveRecord(); if(rec){ rec.badge = e.target.value; updateTimeline(); } });
+
+/* ---------------- TIMELINE + ANNOTATION UI (Phase 3) ---------------- */
+// Renders only the current active line (plies 1..historyPointer) as
+// White/Black move pairs, PGN-table style. A move undone past historyPointer
+// simply stops appearing here (and reappears on redo) — the list always
+// mirrors the real current history, never a stale/duplicate copy of it.
+function updateTimeline(){
+  const el = document.getElementById('timelineList');
+  if(!el) return;
+  el.innerHTML = '';
+  function moveLabel(rec){
+    let label = rec.san || (rec.from + '-' + rec.to);
+    if(rec.badge) label += ' ' + rec.badge;
+    return label;
+  }
+  function makeMoveBtn(rec){
+    const b = document.createElement('button');
+    b.style.padding = '3px 8px';
+    b.style.fontSize = '13px';
+    b.textContent = moveLabel(rec);
+    if(rec.ply === selectedPly) b.classList.add('active');
+    b.title = rec.annotation ? `${moveLabel(rec)} — ${rec.annotation}` : moveLabel(rec);
+    b.onclick = () => selectMove(rec.ply);
+    return b;
+  }
+  for(let i=0; i<historyPointer; i+=2){
+    const whiteRec = moveHistory[i];
+    // Bounds-check against historyPointer, not just array length: after an
+    // undo, moveHistory[i+1] can still exist (it's kept around for redo)
+    // but no longer be part of the ACTIVE line — it must not reappear here
+    // until the user actually redoes it.
+    const blackRec = (i+1 < historyPointer) ? moveHistory[i+1] : undefined;
+    const row = document.createElement('div');
+    row.style.cssText = 'padding:4px 6px;display:flex;gap:6px;align-items:center;border-bottom:1px solid rgba(255,255,255,0.03)';
+    const numSpan = document.createElement('span');
+    numSpan.className = 'small';
+    numSpan.style.minWidth = '20px';
+    numSpan.textContent = (Math.floor(i/2)+1) + '.';
+    row.appendChild(numSpan);
+    row.appendChild(makeMoveBtn(whiteRec));
+    if(blackRec) row.appendChild(makeMoveBtn(blackRec));
+    el.appendChild(row);
+  }
+}
+
+// Populates the "selected move" label and the annotation/badge selects from
+// the active record. Disabled (and cleared) when there's no move yet.
+function updateAnnotationPanel(){
+  const labelEl = document.getElementById('selectedMoveLabel');
+  const annSel = document.getElementById('annotationSelect');
+  const badgeSel = document.getElementById('badgeSelect');
+  if(!labelEl || !annSel || !badgeSel) return;
+  const rec = getActiveRecord();
+  if(!rec){
+    labelEl.textContent = 'No move selected';
+    annSel.value = ''; annSel.disabled = true;
+    badgeSel.value = ''; badgeSel.disabled = true;
+    return;
+  }
+  const moveNum = Math.ceil(rec.ply / 2);
+  const side = rec.color === 'w' ? '.' : '...';
+  const live = rec.ply === historyPointer ? ' (live)' : '';
+  labelEl.textContent = `Move ${moveNum}${side} ${rec.san || rec.to}${live}`;
+  annSel.disabled = false; badgeSel.disabled = false;
+  annSel.value = rec.annotation || '';
+  badgeSel.value = rec.badge || '';
+}
+
+/* history UI (Original, now move-scoped — Phase 3) */
+function updateHistory(){
+  updateTimeline();
+  updateAnnotationPanel();
+  const rec = getActiveRecord();
+  const activeArrows = rec ? rec.arrows : [];
+  const activeHighlights = rec ? rec.highlights : [];
+  const el=document.getElementById('historyList'); el.innerHTML='';
+  activeArrows.forEach((a,i)=>{ const d=document.createElement('div'); d.style.padding='6px'; d.style.borderBottom='1px solid rgba(255,255,255,0.03)'; d.innerHTML=`Arrow ${i+1}: ${a.from} → ${a.to} <button data-i='${i}' style="padding: 2px 5px; font-size: 10px; float: right;">X</button>`; el.appendChild(d); });
+  activeHighlights.forEach((h,i)=>{ const d=document.createElement('div'); d.style.padding='6px'; d.style.borderBottom='1px solid rgba(255,255,255,0.03)'; d.innerHTML=`Highlight ${i+1}: ${h.sq} <button data-i='h${i}' style="padding: 2px 5px; font-size: 10px; float: right;">X</button>`; el.appendChild(d); });
+  el.querySelectorAll('button').forEach(b=>{ b.onclick=()=>{ const id=b.dataset.i; const rec2=getActiveRecord(); if(!rec2) return; if(id.startsWith('h')){ rec2.highlights.splice(parseInt(id.slice(1)),1); } else { rec2.arrows.splice(parseInt(id),1); } redrawOverlay(); updateHistory(); }; });
+}
 
 /* hotkeys (Original) */
-document.addEventListener('keydown', (e)=>{ if(document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return; if(e.key==='m'||e.key==='M'){ document.getElementById('mode').value='move'; document.getElementById('mode').dispatchEvent(new Event('change')); } if(e.key==='a'||e.key==='A'){ document.getElementById('mode').value='arrow'; document.getElementById('mode').dispatchEvent(new Event('change')); } if(e.key==='h'||e.key==='H'){ document.getElementById('mode').value='highlight'; document.getElementById('mode').dispatchEvent(new Event('change')); } if(e.key==='c'||e.key==='C'){ arrows=[]; highlights=[]; redrawOverlay(); updateHistory(); } if(e.key==='f'||e.key==='F'){ document.getElementById('flip').click(); } if(e.code === 'Space'){ e.preventDefault(); document.getElementById('playAnim').click(); } });
+document.addEventListener('keydown', (e)=>{ if(document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return; if(e.key==='m'||e.key==='M'){ document.getElementById('mode').value='move'; document.getElementById('mode').dispatchEvent(new Event('change')); } if(e.key==='a'||e.key==='A'){ document.getElementById('mode').value='arrow'; document.getElementById('mode').dispatchEvent(new Event('change')); } if(e.key==='h'||e.key==='H'){ document.getElementById('mode').value='highlight'; document.getElementById('mode').dispatchEvent(new Event('change')); } if(e.key==='c'||e.key==='C'){ const rec=getActiveRecord(); if(rec){ rec.arrows=[]; rec.highlights=[]; } redrawOverlay(); updateHistory(); } if(e.key==='f'||e.key==='F'){ document.getElementById('flip').click(); } if(e.code === 'Space'){ e.preventDefault(); document.getElementById('playAnim').click(); } });
 
 /* ---------------- ZOOM helpers (MODIFIED for Pan/Zoom) ---------------- */
 function zoomToSquareSmooth(sq){
@@ -1295,27 +1532,25 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
     // moving piece's *post-move* type/color is known directly (fixes
     // promotion export showing a pawn instead of the promoted piece — this
     // is exactly what live preview already reads via game.get(to)).
-    const preSnapshot = JSON.parse(JSON.stringify(moveRec.preSnapshot || game.board()));
     const movingType = moveRec.resultPieceType || 'p';
     const movingColor = moveRec.color || 'w';
     const from = moveRec.from, to = moveRec.to;
     const secondary = moveRec.secondary || null; // castling's rook: {from,to,type:'r',color}
     const extraVacate = moveRec.extraVacate || []; // e.g. en passant's captured-pawn square
+    // Move-scoped (Phase 3): only THIS move's own arrows/highlights are
+    // exported — never a global list that would leak another move's
+    // annotations in. Same fields playRecordAnimation()'s live preview uses.
+    const recArrows = moveRec.arrows || [];
+    const recHighlights = moveRec.highlights || [];
 
     // Vacate every square that must NOT show a static piece during the
     // animation: the primary piece's origin, the secondary (rook) piece's
     // origin when castling, and any extra squares (en passant's captured
     // pawn square, which is not the destination square). A plain capture
     // needs no special handling here — the captured piece sits at `to` and
-    // is naturally covered once the arriving piece is drawn there.
-    (function vacateSquares(){
-      const squares = [from].concat(secondary ? [secondary.from] : []).concat(extraVacate);
-      for(const sqName of squares){
-        const f = 'abcdefgh'.indexOf(sqName[0]);
-        const r = 8 - parseInt(sqName[1]);
-        if(preSnapshot[r] && preSnapshot[r][f]) preSnapshot[r][f] = null;
-      }
-    })();
+    // is naturally covered once the arriving piece is drawn there. Shared
+    // with the historical live-preview path — see vacatedSnapshot().
+    const preSnapshot = vacatedSnapshot(moveRec);
 
     // compute centers
     const startCenter = squareCenter(from);
@@ -1340,11 +1575,11 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
     const boxXs = [startCenter.x, endCenter.x];
     const boxYs = [startCenter.y, endCenter.y];
     if(secondary){ boxXs.push(secondaryStartCenter.x, secondaryEndCenter.x); boxYs.push(secondaryStartCenter.y, secondaryEndCenter.y); }
-    for(const h of highlights){
+    for(const h of recHighlights){
       const hc = squareCenter(h.sq);
       boxXs.push(hc.x); boxYs.push(hc.y);
     }
-    for(const a of arrows){
+    for(const a of recArrows){
       const ac1 = squareCenter(a.from);
       boxXs.push(ac1.x); boxYs.push(ac1.y);
       if(a.to){ const ac2 = squareCenter(a.to); boxXs.push(ac2.x); boxYs.push(ac2.y); }
@@ -1397,12 +1632,12 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
 
     function drawOverlayElementsToTemp(targetCtx){
       const s = LOGICAL_SIZE/8;
-      for(const h of highlights){
+      for(const h of recHighlights){
         const vf = boardFlipped ? (7 - h.file) : h.file;
         const vr = boardFlipped ? (7 - h.rank) : h.rank;
         targetCtx.fillStyle = h.color; targetCtx.globalAlpha = h.alpha; targetCtx.fillRect(vf*s+4, vr*s+4, s-8, s-8); targetCtx.globalAlpha = 1;
       }
-      for(const a of arrows){
+      for(const a of recArrows){
         const from = squareCenter(a.from);
         const to = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
         drawArrow(targetCtx, from, to, a.color, Math.max(4, LOGICAL_SIZE*0.01));
