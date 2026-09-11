@@ -1192,22 +1192,36 @@ document.addEventListener('keydown', (e)=>{ if(document.activeElement.tagName ==
 /* ---------------- ZOOM helpers (MODIFIED for Pan/Zoom) ---------------- */
 function zoomToSquareSmooth(sq){
   const displayPx = boardHolder.clientWidth;
-  const s = LOGICAL_SIZE/8;
-  const c = squareCenter(sq); // Logical coords
-  
-  // Calculate display coords of the square center *under current transform*
-  const current_c_display_x = (c.x * viewTransform.scale) + viewTransform.panX;
-  const current_c_display_y = (c.y * viewTransform.scale) + viewTransform.panY;
-  
-  let scale = 2.5; // Target scale
-  
-  // Calculate pan needed to center the square
-  const targetPanX = (displayPx / 2) - (c.x * scale);
-  const targetPanY = (displayPx / 2) - (c.y * scale);
-  
+  const c = squareCenter(sq); // Logical (0..LOGICAL_SIZE) coords — already flip-aware
+
+  // COORDINATE-SPACE FIX: viewTransform.panX/panY are CSS/display-pixel
+  // offsets (they're applied directly as `canvasWrap.style.transform:
+  // translate(...)px`, exactly like pinch-zoom's onMove handler computes
+  // them), but squareCenter() returns coordinates in the canvas's internal
+  // LOGICAL_SIZE (600x600) bitmap space. Those two spaces only coincide
+  // when the board happens to render at exactly 600 CSS px. Convert the
+  // logical square-center into display-pixel space (at scale=1) first, the
+  // same way the canvas's own CSS width/height already scales its bitmap,
+  // so this works at any board size — matching pinch-zoom's convention.
+  const dispScale = displayPx / LOGICAL_SIZE;
+  const cDisplayX = c.x * dispScale;
+  const cDisplayY = c.y * dispScale;
+
+  let scale = 2.5; // Target scale (unchanged)
+
+  // SECOND COORDINATE FIX: .canvas-wrap has `transform-origin:center center`
+  // (see <style>), so `transform: translate(panX,panY) scale(s)` scales
+  // around the element's own center O=(displayPx/2, displayPx/2), not its
+  // top-left corner — a local point P lands on screen at
+  // `O + scale*(P-O) + (panX,panY)`. Solving that for the pan which puts
+  // the target square's center exactly at O (dead-center of the viewport):
+  const originX = displayPx / 2, originY = displayPx / 2;
+  const targetPanX = scale * (originX - cDisplayX);
+  const targetPanY = scale * (originY - cDisplayY);
+
   const start = {tx: viewTransform.panX || 0, ty: viewTransform.panY || 0, scale: viewTransform.scale || 1};
   const end = {tx: targetPanX, ty: targetPanY, scale: scale};
-  
+
   animateTransform(start, end, 420);
   zoomHint.style.display = 'block';
 }
@@ -1237,9 +1251,18 @@ function animateTransform(from,to,dur){
     redrawOverlay();
 
     if(t < 1) requestAnimationFrame(frame);
-    else { 
-      // Snap to final state
-      viewTransform = {...to}; 
+    else {
+      // Snap to final state. NOTE: `to` is shaped {tx,ty,scale} (this
+      // function's own local naming) while `viewTransform` is shaped
+      // {panX,panY,scale} (used everywhere else, e.g. drawBoard()'s
+      // ctx.translate(viewTransform.panX, viewTransform.panY)) — assigning
+      // `viewTransform = {...to}` here silently corrupted panX/panY to
+      // undefined on every completed zoom/unzoom, breaking any redraw that
+      // happened afterward without going through another animateTransform
+      // call. Set the matching fields explicitly instead.
+      viewTransform.panX = to.tx;
+      viewTransform.panY = to.ty;
+      viewTransform.scale = to.scale;
       canvasWrap.style.transform = `translate(${to.tx}px, ${to.ty}px) scale(${to.scale})`;
       drawBoard();
       redrawOverlay();
@@ -1306,11 +1329,26 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
 
     // PADDING FIX: Use 0.5 for margin as requested
     const margin = LOGICAL_SIZE/8 * 0.5; // "half square" padding
-    // Bounding box covers the primary piece's path, and — for castling —
-    // the rook's path too, so the rook is never animating outside the
-    // cropped frame.
-    const boxXs = [startCenter.x, endCenter.x].concat(secondary ? [secondaryStartCenter.x, secondaryEndCenter.x] : []);
-    const boxYs = [startCenter.y, endCenter.y].concat(secondary ? [secondaryStartCenter.y, secondaryEndCenter.y] : []);
+    // Bounding box covers the primary piece's path, the rook's path when
+    // castling (so it's never animating outside the cropped frame), AND
+    // every currently-active arrow/highlight (drawOverlayElementsToTemp
+    // below already renders these into the export — this just makes sure
+    // the crop doesn't clip them when they extend past the move itself,
+    // e.g. an arrow from a1->h8 while the move is e2-e4). squareCenter()
+    // is reused so these points are already flip-aware, exactly matching
+    // how the annotations themselves are drawn.
+    const boxXs = [startCenter.x, endCenter.x];
+    const boxYs = [startCenter.y, endCenter.y];
+    if(secondary){ boxXs.push(secondaryStartCenter.x, secondaryEndCenter.x); boxYs.push(secondaryStartCenter.y, secondaryEndCenter.y); }
+    for(const h of highlights){
+      const hc = squareCenter(h.sq);
+      boxXs.push(hc.x); boxYs.push(hc.y);
+    }
+    for(const a of arrows){
+      const ac1 = squareCenter(a.from);
+      boxXs.push(ac1.x); boxYs.push(ac1.y);
+      if(a.to){ const ac2 = squareCenter(a.to); boxXs.push(ac2.x); boxYs.push(ac2.y); }
+    }
     const minX = Math.min(...boxXs) - margin;
     const maxX = Math.max(...boxXs) + margin;
     const minY = Math.min(...boxYs) - margin;
