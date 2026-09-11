@@ -353,16 +353,88 @@ let activePointers = new Map(); // For multi-touch tracking
 // NEW: State for UI
 let promotionCallback = null; // To store the promotion choice function
 
-/* ---------------- PIECES (Original Chess_l.html method) ---------------- */
+/* ---------------- PIECES (Chess Cinema original vector set) ----------------
+   Independently designed Staunton-inspired silhouettes, built from stacked
+   primitive shapes (rounded rects / ellipses / polygons) rather than any
+   traced or copied artwork. Same function signature/output shape as before
+   (a data-URI SVG per type+color), so the rest of the app — which already
+   shares these Image objects between live drawing and export rendering via
+   pieceImages[color][type] — needs no other changes.
+*/
 function makePieceSvgData(type, color){
-  const fill = color === 'w' ? '#ffffff' : '#0f0f0f';
-  const stroke = color === 'w' ? 'rgba(0,0,0,0.35)' : 'rgba(255,255,255,0.06)';
-  const glyphMap = {'p':'♟','r':'♜','n':'♞','b':'♝','q':'♛','k':'♚'};
-  const glyph = glyphMap[type];
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">
-  <style>.g{font-family: "DejaVu Serif", "Times New Roman", serif; font-size:420px; dominant-baseline:middle; text-anchor:middle;}</style>
-  <rect width="100%" height="100%" fill="none"/>
-  <g transform="translate(300,330)"><text class="g" fill="${fill}" stroke="${stroke}" stroke-width="8">${glyph}</text></g></svg>`;
+  const isWhite = color === 'w';
+  const fill = isWhite ? '#f3ecd9' : '#3c4046';
+  const stroke = isWhite ? '#2b2519' : '#101114';
+  const sw = 9;
+
+  // Shared base + stem ("trunk") every piece sits on, plus a restrained
+  // highlight/shadow accent on the stem for a touch of roundness.
+  const trunk = `
+    <rect x="182" y="518" width="236" height="42" rx="18" ry="18" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+    <ellipse cx="300" cy="516" rx="100" ry="12" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+    <rect x="250" y="438" width="100" height="82" rx="22" ry="22" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+    <ellipse cx="300" cy="436" rx="62" ry="11" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+    <ellipse cx="274" cy="478" rx="14" ry="26" fill="rgba(255,255,255,0.15)"/>
+    <ellipse cx="326" cy="478" rx="14" ry="26" fill="rgba(0,0,0,0.13)"/>
+  `;
+
+  let body = '';
+  switch(type){
+    case 'p': // pawn: shoulder dome + head ball
+      body = `
+        <ellipse cx="300" cy="378" rx="50" ry="46" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <circle cx="300" cy="298" r="58" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+      `;
+      break;
+    case 'b': // bishop: shoulder + tapered body + mitre dome with diagonal slit + finial
+      body = `
+        <ellipse cx="300" cy="392" rx="58" ry="38" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="266" y="270" width="68" height="130" rx="32" ry="32" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <ellipse cx="300" cy="225" rx="44" ry="54" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="297" y="178" width="6" height="70" rx="3" fill="${stroke}" transform="rotate(-32 300 213)"/>
+        <circle cx="300" cy="150" r="18" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+      `;
+      break;
+    case 'n': // knight: stylized low-poly horse head/neck, facing left, plus ear + eye
+      body = `
+        <polygon points="352,430 356,338 335,235 352,175 316,202 300,175 250,192 197,244 168,276 182,306 217,300 200,336 236,372 258,430" fill="${fill}" stroke="${stroke}" stroke-width="${sw}" stroke-linejoin="round"/>
+        <polygon points="330,206 318,164 300,196" fill="${fill}" stroke="${stroke}" stroke-width="${sw}" stroke-linejoin="round"/>
+        <circle cx="272" cy="228" r="9" fill="${stroke}"/>
+      `;
+      break;
+    case 'r': // rook: tower body + lintel + three crenellations
+      body = `
+        <rect x="238" y="258" width="124" height="172" rx="14" ry="14" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="232" y="248" width="136" height="20" rx="6" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="236" y="196" width="30" height="58" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="285" y="196" width="30" height="58" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="334" y="196" width="30" height="58" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+      `;
+      break;
+    case 'q': // queen: shoulder + body + coronet band + three-point crown with pearls
+      body = `
+        <ellipse cx="300" cy="400" rx="56" ry="34" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="258" y="268" width="84" height="140" rx="30" ry="30" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="230" y="232" width="140" height="34" rx="10" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <polygon points="230,232 248,166 268,206 300,140 332,206 352,166 370,232" fill="${fill}" stroke="${stroke}" stroke-width="${sw}" stroke-linejoin="round"/>
+        <circle cx="248" cy="160" r="11" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <circle cx="300" cy="134" r="13" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <circle cx="352" cy="160" r="11" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+      `;
+      break;
+    case 'k': // king: shoulder + body + flat coronet band + cross finial
+      body = `
+        <ellipse cx="300" cy="400" rx="56" ry="34" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="258" y="268" width="84" height="140" rx="30" ry="30" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="228" y="234" width="144" height="32" rx="10" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <circle cx="300" cy="228" r="17" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="288" y="112" width="24" height="100" rx="6" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="266" y="140" width="68" height="22" rx="6" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+      `;
+      break;
+  }
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">${trunk}${body}</svg>`;
   return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
 }
 
@@ -438,27 +510,38 @@ function readyInit(){
 }
 
 /* ---------------- DRAWING (MODIFIED for Pan/Zoom) ---------------- */
-const darkColor = '#4b0082';
+// Chess Cinema board palette: muted sage-green dark squares, warm cream
+// light squares — a conventional-but-independent green chessboard, not a
+// copy of any specific reference site's exact colors.
+const darkColor = '#4f6f3c';
+const darkColorTop = '#6f9156';
+const lightColorTop = '#f1e9d8';
+const lightColorBottom = '#e2d6ba';
+
+// Shared by drawBoard() (live) and drawBoardToTemp() (export) so the two
+// renderers can never diverge on square color.
+function paintSquare(targetCtx, x, y, s, isDark){
+  const g = targetCtx.createLinearGradient(x,y,x+s,y+s);
+  if(isDark){ g.addColorStop(0,darkColorTop); g.addColorStop(1,darkColor); }
+  else { g.addColorStop(0,lightColorTop); g.addColorStop(1,lightColorBottom); }
+  targetCtx.fillStyle = g;
+  targetCtx.fillRect(x,y,s,s);
+}
 
 function drawBoard(){
   const s = LOGICAL_SIZE/8;
-  
+
   ctx.save();
   // NEW: Apply pan/zoom transform to the base canvas
   ctx.translate(viewTransform.panX, viewTransform.panY);
   ctx.scale(viewTransform.scale, viewTransform.scale);
-  
+
   ctx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE);
   for(let r=0;r<8;r++){
     for(let f=0;f<8;f++){
       const x = f*s, y = r*s;
       const isDark = ((r+f)%2===1);
-      if(isDark){
-        const g = ctx.createLinearGradient(x,y,x+s,y+s); g.addColorStop(0,'#5b0075'); g.addColorStop(1,darkColor); ctx.fillStyle = g;
-      } else {
-        const g = ctx.createLinearGradient(x,y,x+s,y+s); g.addColorStop(0,'#ffffff'); g.addColorStop(1,'#f3f1f2'); ctx.fillStyle = g;
-      }
-      ctx.fillRect(x,y,s,s);
+      paintSquare(ctx, x, y, s, isDark);
     }
   }
   drawPieces();
@@ -1163,9 +1246,7 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS, duration:ANIM_DURAT
         for(let f=0;f<8;f++){
           const x = f*s, y = r*s;
           const isDark = ((r+f)%2===1);
-          if(isDark){ const g = tctx.createLinearGradient(x,y,x+s,y+s); g.addColorStop(0,'#5b0075'); g.addColorStop(1,darkColor); tctx.fillStyle = g; }
-          else { const g = tctx.createLinearGradient(x,y,x+s,y+s); g.addColorStop(0,'#ffffff'); g.addColorStop(1,'#f3f1f2'); tctx.fillStyle = g; }
-          tctx.fillRect(x,y,s,s);
+          paintSquare(tctx, x, y, s, isDark);
         }
       }
       // draw pieces from snapshot (without moving piece)
