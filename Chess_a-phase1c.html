@@ -1302,13 +1302,19 @@ function computeMoveDuration(record, baseDuration){
   baseDuration = baseDuration || ANIM_DURATION_MS;
   const start = squareCenter(record.from), end = squareCenter(record.to);
   const travelSquares = Math.hypot(end.x - start.x, end.y - start.y) / (LOGICAL_SIZE/8);
-  // Phase 7: nudged from 120->150ms/square and the cap from 2600->2800ms.
-  // A full-length rook/queen move (7 squares) now gets 2250ms instead of
-  // 2100ms, and the longest possible move on the board (the 9.9-square
-  // a1-h8 diagonal) reaches ~2685ms without hitting the new cap — still
-  // comfortably inside it, so extreme moves aren't truncated either. Short
-  // moves (<=2 squares) are completely unaffected.
-  const BASE_SQUARES = 2, EXTRA_MS_PER_SQUARE = 150, MAX_DURATION_MS = 2800;
+  // Phase 7: nudged from 120->150ms/square. A full-length rook/queen move
+  // (7 squares) gets 2250ms at the live base, and the longest possible move
+  // on the board (the 9.9-square a1-h8 diagonal) reaches ~2685ms. Short
+  // moves (<=2 squares) are exactly baseDuration.
+  // The cap only exists to stop a pathological distance running away; it is
+  // deliberately above every reachable value at BOTH bases in use, so it
+  // never truncates a real move: at the live base (1500) the longest move is
+  // 2685ms, and at the export base (EXPORT_MOVEMENT_BASE_MS, 2000) it is
+  // 3185ms. Raising it from 2800 therefore changes no live duration at all —
+  // live could never reach 2800 in the first place — and only stops the
+  // export's larger base from being clipped, which would have truncated
+  // exactly the long moves the export most needs to show in full.
+  const BASE_SQUARES = 2, EXTRA_MS_PER_SQUARE = 150, MAX_DURATION_MS = 3400;
   const scaled = baseDuration + Math.max(0, travelSquares - BASE_SQUARES) * EXTRA_MS_PER_SQUARE;
   return Math.round(Math.min(MAX_DURATION_MS, Math.max(baseDuration, scaled)));
 }
@@ -1946,10 +1952,32 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     const secondaryStartCenter = secondary ? squareCenter(secondary.from) : null;
     const secondaryEndCenter = secondary ? squareCenter(secondary.to) : null;
 
-    // Distance-scaled duration — see computeMoveDuration() (shared with
-    // live preview's animateRecord()), unless the caller explicitly
-    // overrides it via opts.duration.
-    const duration = opts.duration || computeMoveDuration(moveRec);
+    // ---------------- EXPORT PHASE TIMING (the export contract) ----------
+    // The exported clip is an explicit four-phase state machine:
+    //
+    //   PHASE A  MOVEMENT      elapsed < duration, t = elapsed/duration,
+    //                          the piece travels its real pieceTrajectory()
+    //   PHASE B  LANDING       the first frame where t>=1 — pieceTrajectory
+    //                          is no longer consulted, the piece is pinned to
+    //                          its exact destination, a promotion becomes the
+    //                          promoted piece, en passant's captured pawn is
+    //                          removed. The final chess position is now what
+    //                          is on screen.
+    //   PHASE C  FINAL HOLD    exactly FINAL_HOLD_MS of that settled state,
+    //                          during which the check context (if any) eases
+    //                          in and then sits still long enough to read
+    //   PHASE D  STOP          frame production and the recorder stop, and
+    //                          only here — never on movement time alone
+    //
+    // Movement is deliberately unhurried: a truncated-looking move is a far
+    // worse outcome than a slightly long clip, so the export runs on its own
+    // larger base (2000ms floor) rather than the live animation's 1500ms,
+    // still scaled by distance through the same shared computeMoveDuration()
+    // so a long move gets proportionally more time. Live animation timing is
+    // untouched — it keeps calling computeMoveDuration(record) with the
+    // default base.
+    const EXPORT_MOVEMENT_BASE_MS = 2000;
+    const duration = opts.duration || computeMoveDuration(moveRec, EXPORT_MOVEMENT_BASE_MS);
 
     // -------------------------------------------------
     // --- START FINAL FIX (Padding + Context) ---
@@ -2086,14 +2114,34 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     if(checkSq){
       const cxs = [endCenter.x - SQ/2 - margin, endCenter.x + SQ/2 + margin, checkSq.x - SQ/2 - margin, checkSq.x + SQ/2 + margin];
       const cys = [endCenter.y - SQ/2 - margin, endCenter.y + SQ/2 + margin, checkSq.y - SQ/2 - margin, checkSq.y + SQ/2 + margin];
-      holdBox = cap(Math.max(Math.max(...cxs) - Math.min(...cxs), Math.max(...cys) - Math.min(...cys)), MIN_BOX, LOGICAL_SIZE);
-      holdBox = Math.max(holdBox, Math.min(boxSize, LOGICAL_SIZE));
+      // The box that actually contains BOTH the landing square and the
+      // checked king, with the usual half-square margin.
+      const needed = Math.max(Math.max(...cxs) - Math.min(...cxs), Math.max(...cys) - Math.min(...cys));
+      // The ONLY ceiling on the check hold is the board itself: the check
+      // context must be free to open out past the movement framing whenever
+      // the king is further away than the movement box reached, otherwise
+      // the thing the settle exists to show is cropped out of its own beat.
+      // boxSize acts purely as a FLOOR here (with MIN_BOX), so the settle
+      // widens or holds and never tightens back in on the movement framing.
+      holdBox = Math.min(LOGICAL_SIZE, Math.max(needed, MIN_BOX, boxSize));
       holdCamX = (Math.min(...cxs) + Math.max(...cxs))/2;
       holdCamY = (Math.min(...cys) + Math.max(...cys))/2;
     }
-    // A short beat after the landing so the move reads as "arrived" (and,
-    // for a check, long enough to take in the checking relationship).
-    const holdMs = checkSq ? 850 : 260;
+    // PHASE C. Every exported move ends on the same beat: exactly one second
+    // of the finished, fully landed position. Previously this was a
+    // check-dependent 850/260ms that the export ALSO used as its stop
+    // condition, so the camera finished easing into the check framing on the
+    // very frame the recorder was told to stop — the settled check context
+    // existed for about one frame and was effectively never seen. The hold
+    // is now a fixed, deliberately generous beat that is timed from the
+    // LANDING FRAME (not from movement time) and must actually be rendered
+    // before the export may stop; the check framing eases in over its first
+    // part so the rest is a still, readable final state.
+    const FINAL_HOLD_MS = 1000;
+    // Fraction of the hold spent easing the camera into the check context.
+    // The remainder (~55%) is held completely static, which is what makes
+    // the final state readable rather than merely reached.
+    const HOLD_SETTLE_FRACTION = 0.45;
 
     // --- CONTEXT FIX: These functions are now restored ---
     // These functions are helpers *inside* exportLastMoveAsWebM
@@ -2269,7 +2317,7 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
 
     // Start recorder
     recorder.start();
-    showMessage('Recording... Please wait.', 'success', duration + holdMs + 500);
+    showMessage('Recording... Please wait.', 'success', duration + FINAL_HOLD_MS + 500);
 
     // Produce frames: one rendered+pushed frame per requestAnimationFrame
     // tick, throttled to ~fps (via minFrameIntervalMs) so file size/frame
@@ -2288,20 +2336,42 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     let t0 = null;
     let lastPushedAt = -Infinity;
     let finished = false;
+    // PHASE B anchor: the timestamp of the first frame that actually
+    // rendered the landed state. The hold is measured from THIS, not from
+    // t0+duration, so a late/slow rAF tick can never consume the hold before
+    // a single settled frame has been drawn — the previous loop derived hold
+    // progress from raw elapsed time, so one long stall could jump straight
+    // from mid-movement to "hold complete" and stop the recorder having
+    // never rendered the finished position at all.
+    let landedAt = null;
+    // Frames of the settled final state actually pushed into the recording.
+    let holdFramesPushed = 0;
+    // The hold must be REAL frames, not just elapsed milliseconds: require a
+    // minimum count as well as the full FINAL_HOLD_MS so the final state is
+    // genuinely present in the file even under frame-rate pressure.
+    const MIN_HOLD_FRAMES = 6;
 
     function frameStep(now){
       if(finished) return;
       if(t0 === null) t0 = now;
       const elapsed = now - t0;
       const t = Math.min(1, elapsed / duration);
-      // Hold progress (0..1) for the beat AFTER the piece has landed.
-      const h = holdMs > 0 ? Math.max(0, Math.min(1, (elapsed - duration) / holdMs)) : 1;
 
       // -------------------------------------------------
       // --- START RENDER LOOP (with Context) ---
       // -------------------------------------------------
 
+      // PHASE A while t<1; PHASE B on the first frame t>=1; PHASE C after.
       const landed = t >= 1;
+      if(landed && landedAt === null) landedAt = now;
+      // Hold progress (0..1) and camera settle progress, both timed from the
+      // landing frame. settle completes early within the hold (see
+      // HOLD_SETTLE_FRACTION) so the remainder is a static final state.
+      const heldMs = landed ? (now - landedAt) : 0;
+      const h = landed ? Math.min(1, heldMs / FINAL_HOLD_MS) : 0;
+      const settleProgress = landed
+        ? Math.min(1, heldMs / (FINAL_HOLD_MS * HOLD_SETTLE_FRACTION))
+        : 0;
 
       // 1. Draw the board, static pieces, and overlays
       drawBoardToTemp(landed);
@@ -2362,8 +2432,12 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       const camY = camY0 + (camY1 - camY0) * prog;
 
       // Ease toward the end framing during the hold (only differs from the
-      // movement framing when this move gives check).
-      const settle = easeInOutCubic(h);
+      // movement framing when this move gives check). Driven by
+      // settleProgress, which completes partway into the hold, so the check
+      // context arrives and is then HELD still — never arriving exactly as
+      // the recorder stops. It is zero for every frame before landing, so
+      // the check state cannot begin while the piece is still in transit.
+      const settle = easeInOutCubic(settleProgress);
       const frameBox = boxSize + (holdBox - boxSize) * settle;
       const frameCamX = camX + (holdCamX - camX) * settle;
       const frameCamY = camY + (holdCamY - camY) * settle;
@@ -2389,17 +2463,29 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
 
       // 6. Push exactly this frame into the capture stream (manual mode
       //    only — the auto-rate fallback captures on its own clock).
-      if(canRequestFrame && (now - lastPushedAt >= minFrameIntervalMs || h >= 1)){
+      //    The LANDING frame (PHASE B) is always pushed regardless of the
+      //    fps throttle: it is the canonical "arrived" frame and must exist
+      //    in the file. Hold frames are counted so termination can require
+      //    real rendered frames, not just elapsed time.
+      const isLandingFrame = landed && holdFramesPushed === 0;
+      if(canRequestFrame && (now - lastPushedAt >= minFrameIntervalMs || isLandingFrame)){
         track.requestFrame();
         lastPushedAt = now;
+        if(landed) holdFramesPushed++;
       }
 
-      if(h < 1){
+      // PHASE D. Stop ONLY when the movement has actually reached t>=1 AND a
+      // full FINAL_HOLD_MS of that landed state has elapsed since the landing
+      // frame AND enough real frames of it have been pushed. Movement time,
+      // camera arrival and frame counts can no longer end the export on their
+      // own — the phase state does.
+      const holdComplete = landed && h >= 1 && holdFramesPushed >= MIN_HOLD_FRAMES;
+      if(!holdComplete){
         requestAnimationFrame(frameStep);
       } else {
         finished = true;
         // tiny extra delay before stopping so the final frame is flushed/stable
-        setTimeout(()=>{ recorder.stop(); }, 80);
+        setTimeout(()=>{ recorder.stop(); }, 120);
       }
     }
     requestAnimationFrame(frameStep);
