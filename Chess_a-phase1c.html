@@ -373,6 +373,17 @@ let removeMode = false;
 // shown/exported on every move regardless of which move they were drawn for.
 let moveHistory = []; // append-only move records
 let historyPointer = 0; // moveHistory[0..historyPointer-1] are currently applied to `game`
+// How much of moveHistory is guaranteed to stay put even though `game`/
+// historyPointer haven't been driven that far yet (Phase 7: PGN import
+// builds the full moveHistory but starts navigation at the beginning, so
+// the imported line's plies need to be selectable/visible in the timeline
+// immediately - not just once Next has walked `game` up to them). 0 for a
+// normally-played game, where "beyond historyPointer" genuinely means
+// "undone, and may vanish if a new move branches off" - see
+// updateTimeline()'s and selectMove()'s own comments for why that distinction
+// matters. Clamped down whenever a new move truncates moveHistory, so it
+// can never claim more than actually exists.
+let importedLimit = 0;
 let lastMoveRecord = null; // always mirrors moveHistory[historyPointer-1], or null at the start position
 let animHideSquares = new Set(); // squares whose pieces are mid-flight (hide the static copy); a Set so castling can hide both the king's and rook's destination squares at once
 
@@ -1076,6 +1087,10 @@ function attemptMove(from,to,promotion){
     if(historyPointer < moveHistory.length) moveHistory.length = historyPointer;
     moveHistory.push(record);
     historyPointer = moveHistory.length;
+    // A branch off an imported line's "known future" genuinely discards it
+    // (moveHistory.length was just truncated above), so importedLimit can
+    // never claim more than what's actually left.
+    importedLimit = Math.min(importedLimit, moveHistory.length);
     syncTransientMoveState();
 
     updateStatus(); // <-- NEW
@@ -1214,15 +1229,21 @@ function vacatedSnapshot(record){
   return snap;
 }
 
-// Selects a move from the timeline for annotation/preview/export. Only
-// moves within the CURRENT active line (1..historyPointer) are selectable
-// — deliberately not the undone "redo future" beyond historyPointer, so
-// this never needs to reconstruct a position `game` itself can't also
-// reach by redoing. Never touches `game`/`historyPointer`: selecting a
-// historical move only sets a read-only preview snapshot that drawPieces()
-// renders instead of the live position (see previewBoard above).
+// Selects a move from the timeline for annotation/preview/export. Moves
+// within the CURRENT active line (1..historyPointer) are always selectable
+// — deliberately not the undone "redo future" beyond historyPointer for a
+// normally-played game, since this never needs to reconstruct a position
+// `game` itself can't also reach by redoing, AND that "future" may vanish
+// without notice if a new move branches off before it's redone. Imported
+// PGN plies get the same immediate selectability up to importedLimit
+// instead: unlike an undone move, they're the definitive, already-fully-
+// built line (not a stale might-be-overwritten one) until the user
+// actually plays a new move from mid-game, at which point importedLimit is
+// clamped back down (see attemptMove). Never touches `game`/`historyPointer`:
+// selecting a historical move only sets a read-only preview snapshot that
+// drawPieces() renders instead of the live position (see previewBoard above).
 function selectMove(ply){
-  if(ply < 1 || ply > historyPointer) return;
+  if(ply < 1 || ply > Math.max(historyPointer, importedLimit)) return;
   selectedPly = ply;
   previewBoard = boardAfterPly(ply);
   drawBoard();
@@ -1281,7 +1302,13 @@ function computeMoveDuration(record, baseDuration){
   baseDuration = baseDuration || ANIM_DURATION_MS;
   const start = squareCenter(record.from), end = squareCenter(record.to);
   const travelSquares = Math.hypot(end.x - start.x, end.y - start.y) / (LOGICAL_SIZE/8);
-  const BASE_SQUARES = 2, EXTRA_MS_PER_SQUARE = 120, MAX_DURATION_MS = 2600;
+  // Phase 7: nudged from 120->150ms/square and the cap from 2600->2800ms.
+  // A full-length rook/queen move (7 squares) now gets 2250ms instead of
+  // 2100ms, and the longest possible move on the board (the 9.9-square
+  // a1-h8 diagonal) reaches ~2685ms without hitting the new cap — still
+  // comfortably inside it, so extreme moves aren't truncated either. Short
+  // moves (<=2 squares) are completely unaffected.
+  const BASE_SQUARES = 2, EXTRA_MS_PER_SQUARE = 150, MAX_DURATION_MS = 2800;
   const scaled = baseDuration + Math.max(0, travelSquares - BASE_SQUARES) * EXTRA_MS_PER_SQUARE;
   return Math.round(Math.min(MAX_DURATION_MS, Math.max(baseDuration, scaled)));
 }
@@ -1493,7 +1520,7 @@ document.getElementById('undo').addEventListener('click', stepBackward);
 document.getElementById('redo').addEventListener('click', stepForward);
 document.getElementById('prevMove').addEventListener('click', stepBackward);
 document.getElementById('nextMove').addEventListener('click', stepForward);
-document.getElementById('reset').addEventListener('click', ()=>{ game.reset(); selectedSquare=null; moveHistory=[]; historyPointer=0; syncTransientMoveState(); updateStatus(); unzoomSmooth(); drawBoard(); redrawOverlay(); updateHistory(); });
+document.getElementById('reset').addEventListener('click', ()=>{ game.reset(); selectedSquare=null; moveHistory=[]; historyPointer=0; importedLimit=0; syncTransientMoveState(); updateStatus(); unzoomSmooth(); drawBoard(); redrawOverlay(); updateHistory(); });
 
 /* ---------------- PGN IMPORT (Phase 6) ----------------
    Brings a real game in from Chess.com / Lichess / anywhere so the user
@@ -1559,6 +1586,10 @@ function importPgn(text){
   selectedSquare = null;
   moveHistory = [];
   historyPointer = 0;
+  // Reset before replay: attemptMove() clamps importedLimit down to
+  // moveHistory.length on every push (see attemptMove), so a stale limit
+  // left over from a PREVIOUS import would otherwise cap this new one at 1.
+  importedLimit = 0;
 
   let applied = 0;
   for(const mv of moves){
@@ -1566,14 +1597,29 @@ function importPgn(text){
     applied++;
   }
 
+  if(!applied) return fail('Could not replay that PGN.');
+
+  // attemptMove() (via the loop above) leaves `game` and `historyPointer`
+  // at the LAST imported ply — necessary so buildMoveRecord() could snapshot
+  // each position as it was built. But a fresh import should hand the user
+  // the START of the game, not its end: rewind `game` back to the starting
+  // position with the same game.undo() stepBackward() already uses, WITHOUT
+  // touching moveHistory itself, so Next immediately plays Move 1 and every
+  // ply is still there to step through (or click in the timeline).
+  for(let i=0;i<applied;i++) game.undo();
+  historyPointer = 0;
+  // The whole imported line is immediately selectable/visible in the
+  // timeline (see importedLimit above) even though historyPointer starts at
+  // 0 - it's the definitive history, not an undone one.
+  importedLimit = applied;
+
   syncTransientMoveState();
   updateStatus(); drawBoard(); redrawOverlay(); updateHistory();
 
-  if(!applied) return fail('Could not replay that PGN.');
   const msg = applied === moves.length
     ? `Imported ${applied} moves.`
     : `Imported ${applied} of ${moves.length} moves.`;
-  if(statusEl) statusEl.textContent = msg + ' Use Prev/Next or click a move.';
+  if(statusEl) statusEl.textContent = msg + ' Press Next to start from Move 1.';
   showMessage(msg, 'success');
   return true;
 }
@@ -1628,13 +1674,19 @@ function updateTimeline(){
     b.onclick = () => selectMove(rec.ply);
     return b;
   }
-  for(let i=0; i<historyPointer; i+=2){
+  // Shows the current active line (1..historyPointer) exactly as before for
+  // a normally-played game, PLUS an imported PGN's full line up front (see
+  // importedLimit above) — an imported line is the definitive history, not
+  // an undone one, so it doesn't need to wait for Next to walk `game` up to
+  // each ply before it can appear here.
+  const visibleLimit = Math.max(historyPointer, importedLimit);
+  for(let i=0; i<visibleLimit; i+=2){
     const whiteRec = moveHistory[i];
-    // Bounds-check against historyPointer, not just array length: after an
-    // undo, moveHistory[i+1] can still exist (it's kept around for redo)
-    // but no longer be part of the ACTIVE line — it must not reappear here
-    // until the user actually redoes it.
-    const blackRec = (i+1 < historyPointer) ? moveHistory[i+1] : undefined;
+    // Bounds-check against visibleLimit, not just array length: after an
+    // undo (with no imported future), moveHistory[i+1] can still exist
+    // (it's kept around for redo) but no longer be part of the ACTIVE line
+    // — it must not reappear here until the user actually redoes it.
+    const blackRec = (i+1 < visibleLimit) ? moveHistory[i+1] : undefined;
     const row = document.createElement('div');
     row.style.cssText = 'padding:4px 6px;display:flex;gap:6px;align-items:center;border-bottom:1px solid rgba(255,255,255,0.03)';
     const numSpan = document.createElement('span');
