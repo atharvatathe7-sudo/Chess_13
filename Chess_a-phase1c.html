@@ -1913,14 +1913,32 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     const recArrows = moveRec.arrows || [];
     const recHighlights = moveRec.highlights || [];
 
-    // Vacate every square that must NOT show a static piece during the
-    // animation: the primary piece's origin, the secondary (rook) piece's
-    // origin when castling, and any extra squares (en passant's captured
-    // pawn square, which is not the destination square). A plain capture
-    // needs no special handling here — the captured piece sits at `to` and
-    // is naturally covered once the arriving piece is drawn there. Shared
-    // with the historical live-preview path — see vacatedSnapshot().
-    const preSnapshot = vacatedSnapshot(moveRec);
+    // Two static-board snapshots, not one — the captured piece in an en
+    // passant capture must stay visible while the capturing pawn is still
+    // travelling and disappear only once it lands (see bug report: "the
+    // captured pawn is NOT visible during the export"). vacatedSnapshot()
+    // (shared with the historical live-preview path) clears the primary
+    // piece's origin, castling's rook origin, AND extraVacate (en passant's
+    // captured-pawn square, which is not the destination square) — correct
+    // for the LANDED board, but clearing extraVacate from frame one erases
+    // the captured pawn for the entire clip, before the capture has
+    // visually happened. During the movement phase only the ORIGIN squares
+    // (this piece's `from`, and castling's rook `from`) are cleared, so the
+    // en passant target square keeps showing its pawn until landing. A
+    // plain capture needs no such handling — the captured piece sits at
+    // `to`, which neither snapshot ever clears, and is naturally covered
+    // once the arriving piece is drawn there.
+    function snapshotClearing(squares){
+      const snap = JSON.parse(JSON.stringify(moveRec.preSnapshot || game.board()));
+      for(const sqName of squares){
+        const f = 'abcdefgh'.indexOf(sqName[0]);
+        const r = 8 - parseInt(sqName[1]);
+        if(snap[r] && snap[r][f]) snap[r][f] = null;
+      }
+      return snap;
+    }
+    const preSnapshotDuringMove = snapshotClearing([from].concat(secondary ? [secondary.from] : []));
+    const preSnapshotLanded = vacatedSnapshot(moveRec);
 
     // compute centers
     const startCenter = squareCenter(from);
@@ -2124,7 +2142,7 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       }
     }
 
-    function drawBoardToTemp(){
+    function drawBoardToTemp(landed){
       tctx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE);
       const s = LOGICAL_SIZE/8;
       // draw squares
@@ -2135,8 +2153,10 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
           paintSquare(tctx, x, y, s, isDark);
         }
       }
-      // draw pieces from snapshot (without moving piece)
-      drawPiecesFromSnapshotTo(tctx, preSnapshot);
+      // draw pieces from snapshot (without moving piece). Before landing,
+      // en passant's captured pawn is still on its original square; once
+      // landed it's cleared along with the mover's own origin square(s).
+      drawPiecesFromSnapshotTo(tctx, landed ? preSnapshotLanded : preSnapshotDuringMove);
       // draw arrows & highlights
       drawOverlayElementsToTemp(tctx);
     }
@@ -2281,21 +2301,42 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       // --- START RENDER LOOP (with Context) ---
       // -------------------------------------------------
 
+      const landed = t >= 1;
+
       // 1. Draw the board, static pieces, and overlays
-      drawBoardToTemp();
+      drawBoardToTemp(landed);
 
       // 2. Compute moving piece state at t, and the secondary (rook) piece's
       //    state too when castling — same pieceTrajectory() the live
       //    animation and the camera framing use.
-      const state = pieceTrajectory(travelType, startCenter, endCenter, t);
+      //
+      //    Once landed (t>=1), the state is pinned to the exact resting
+      //    pose instead of calling pieceTrajectory() again at t=1. Several
+      //    of its per-type curves carry a flourish that never fully
+      //    resolves at t=1 — e.g. the default/pawn curve's hop
+      //    (`-6*bob`) is still -3px at t=1, and the king's own curve
+      //    deliberately eases to t*0.9 and never reaches 1 — so re-querying
+      //    pieceTrajectory(...,1) every hold-phase frame kept rendering the
+      //    piece a few pixels off its square for the entire settle/check
+      //    beat, which reads as "still in transit" right when the check
+      //    context is supposed to be taking over. The live preview never
+      //    has this problem because it simply stops drawing the animated
+      //    piece once its own loop finishes (see animPiece); this makes
+      //    export match that already-correct behaviour instead of changing
+      //    any in-flight curve.
+      const state = landed
+        ? {x: endCenter.x, y: endCenter.y, angle: 0, scale: 1, e: 1}
+        : pieceTrajectory(travelType, startCenter, endCenter, t);
       let secondaryState = null;
       if(secondary){
-        secondaryState = pieceTrajectory(secondary.type, secondaryStartCenter, secondaryEndCenter, t);
+        secondaryState = landed
+          ? {x: secondaryEndCenter.x, y: secondaryEndCenter.y, angle: 0, scale: 1, e: 1}
+          : pieceTrajectory(secondary.type, secondaryStartCenter, secondaryEndCenter, t);
       }
 
       // 3. Draw the moving piece(s) on top of the context. A promotion only
       //    becomes the promoted piece once the pawn has actually arrived.
-      const drawnType = (t >= 1) ? landType : travelType;
+      const drawnType = landed ? landType : travelType;
       drawMovingPieceToTemp(movingColor, drawnType, state);
       if(secondary){
         drawMovingPieceToTemp(secondary.color, secondary.type, secondaryState);
