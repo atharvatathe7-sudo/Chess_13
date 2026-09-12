@@ -2320,58 +2320,64 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     showMessage('Recording... Please wait.', 'success', duration + FINAL_HOLD_MS + 500);
 
     // Produce frames: one rendered+pushed frame per requestAnimationFrame
-    // tick, throttled to ~fps (via minFrameIntervalMs) so file size/frame
-    // rate stay close to the requested target on high-refresh-rate
-    // displays, but `t` itself always reflects true elapsed time.
+    // tick that clears the ~fps pacing gate, so file size/frame rate stay
+    // close to the requested target on high-refresh-rate displays.
     const minFrameIntervalMs = 1000 / fps;
-    // t0 is anchored to the FIRST rAF callback's own timestamp (captured
-    // lazily below), not a performance.now() call made before registering
-    // it. If the browser is briefly busy between that registration and the
-    // first callback actually firing (layout/GC/scheduling — plausible
-    // right after the drag-drop interaction that triggered this export),
-    // an eagerly-captured t0 could already be "behind" by the time the
-    // first frame runs, making elapsed>=duration on frame 1 and collapsing
-    // the whole export to a single frame. Anchoring to the first real tick
-    // makes elapsed exactly 0 on that frame regardless of any such delay.
-    let t0 = null;
+    // ---------------- DETERMINISTIC FRAME SCHEDULE ----------------
+    // The clip is defined as an exact NUMBER OF FRAMES, not as a wall-clock
+    // window.
+    //
+    // Every previous version computed t (and the hold/settle progress) from
+    // performance.now(), while frames were only produced when
+    // requestAnimationFrame happened to fire. Those are two different things:
+    // the animation advanced on the wall clock whether or not a frame was
+    // produced, so whatever span the browser stalled through was simply never
+    // encoded. That made completeness a function of machine speed and
+    // background load rather than of the code — the same move exported
+    // correctly on a quiet moment and truncated on a busy one. Measured with
+    // 383ms rAF gaps: a move jumped 15-20% of its trajectory between
+    // consecutive encoded frames, the settle went 0 -> 1 in a single step,
+    // and the hold collapsed from ~21 frames to 5.
+    //
+    // Now frameIndex is the only thing that advances the animation, and it
+    // advances by exactly one per PUSHED frame. The same move therefore
+    // always encodes the same frames in the same order. A stalled or slow
+    // browser makes the clip take longer and play back slower; it can no
+    // longer make it incomplete.
+    const MOVEMENT_FRAMES = Math.max(2, Math.round((duration / 1000) * fps));
+    const HOLD_FRAMES     = Math.max(2, Math.round((FINAL_HOLD_MS / 1000) * fps));
+    // Frames of the hold spent easing into the check context; the rest are
+    // fully settled. Both are frame counts now, so the check context is
+    // guaranteed to be encoded across real frames instead of whatever
+    // happened to fall inside a wall-clock window.
+    const SETTLE_FRAMES   = Math.max(1, Math.round(HOLD_FRAMES * HOLD_SETTLE_FRACTION));
+    let frameIndex = 0;   // 0..MOVEMENT_FRAMES-1 movement, ==MOVEMENT_FRAMES landing, beyond it hold
     let lastPushedAt = -Infinity;
     let finished = false;
-    // PHASE B anchor: the timestamp of the first frame that actually
-    // rendered the landed state. The hold is measured from THIS, not from
-    // t0+duration, so a late/slow rAF tick can never consume the hold before
-    // a single settled frame has been drawn — the previous loop derived hold
-    // progress from raw elapsed time, so one long stall could jump straight
-    // from mid-movement to "hold complete" and stop the recorder having
-    // never rendered the finished position at all.
-    let landedAt = null;
-    // Frames of the settled final state actually pushed into the recording.
-    let holdFramesPushed = 0;
-    // The hold must be REAL frames, not just elapsed milliseconds: require a
-    // minimum count as well as the full FINAL_HOLD_MS so the final state is
-    // genuinely present in the file even under frame-rate pressure.
-    const MIN_HOLD_FRAMES = 6;
 
     function frameStep(now){
       if(finished) return;
-      if(t0 === null) t0 = now;
-      const elapsed = now - t0;
-      const t = Math.min(1, elapsed / duration);
+      // Pace to ~fps against the wall clock so a healthy machine still
+      // produces a real-time-length clip — but this only ever DELAYS the next
+      // frame, it never skips a schedule step. Frame content is a function of
+      // frameIndex alone.
+      if(now - lastPushedAt < minFrameIntervalMs){ requestAnimationFrame(frameStep); return; }
 
       // -------------------------------------------------
       // --- START RENDER LOOP (with Context) ---
       // -------------------------------------------------
 
-      // PHASE A while t<1; PHASE B on the first frame t>=1; PHASE C after.
-      const landed = t >= 1;
-      if(landed && landedAt === null) landedAt = now;
-      // Hold progress (0..1) and camera settle progress, both timed from the
-      // landing frame. settle completes early within the hold (see
-      // HOLD_SETTLE_FRACTION) so the remainder is a static final state.
-      const heldMs = landed ? (now - landedAt) : 0;
-      const h = landed ? Math.min(1, heldMs / FINAL_HOLD_MS) : 0;
-      const settleProgress = landed
-        ? Math.min(1, heldMs / (FINAL_HOLD_MS * HOLD_SETTLE_FRACTION))
-        : 0;
+      // PHASE A while frameIndex<MOVEMENT_FRAMES; PHASE B exactly at
+      // MOVEMENT_FRAMES (the landing frame, holdIndex 0); PHASE C after.
+      const t = Math.min(1, frameIndex / MOVEMENT_FRAMES);
+      const landed = frameIndex >= MOVEMENT_FRAMES;
+      const holdIndex = landed ? (frameIndex - MOVEMENT_FRAMES) : -1;
+      // Hold progress and camera settle progress, both counted in FRAMES from
+      // the landing frame. The landing frame itself is holdIndex 0, so the
+      // check context can never begin before the piece has been rendered
+      // settled on its destination.
+      const h = landed ? Math.min(1, holdIndex / HOLD_FRAMES) : 0;
+      const settleProgress = landed ? Math.min(1, holdIndex / SETTLE_FRAMES) : 0;
 
       // 1. Draw the board, static pieces, and overlays
       drawBoardToTemp(landed);
@@ -2461,31 +2467,34 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
         0, 0, EXPORT_SIZE, EXPORT_SIZE
       );
 
-      // 6. Push exactly this frame into the capture stream (manual mode
-      //    only — the auto-rate fallback captures on its own clock).
-      //    The LANDING frame (PHASE B) is always pushed regardless of the
-      //    fps throttle: it is the canonical "arrived" frame and must exist
-      //    in the file. Hold frames are counted so termination can require
-      //    real rendered frames, not just elapsed time.
-      const isLandingFrame = landed && holdFramesPushed === 0;
-      if(canRequestFrame && (now - lastPushedAt >= minFrameIntervalMs || isLandingFrame)){
-        track.requestFrame();
-        lastPushedAt = now;
-        if(landed) holdFramesPushed++;
-      }
+      // 6. Push exactly this frame into the capture stream. Every frame the
+      //    schedule defines is pushed — there is no throttle decision here
+      //    any more, because the pacing above already decided that this tick
+      //    produces a frame. The schedule advances only on a pushed frame, so
+      //    a frame can never be skipped, including the landing frame.
+      //    (In the auto-rate fallback the browser samples the canvas on its
+      //    own clock; the schedule still advances identically, which is what
+      //    lets the loop terminate in that mode at all — the previous
+      //    termination test counted manually-pushed frames, so with
+      //    requestFrame unavailable it could never be satisfied and the loop
+      //    ran forever without ever stopping the recorder.)
+      if(canRequestFrame) track.requestFrame();
+      lastPushedAt = now;
+      frameIndex++;
 
-      // PHASE D. Stop ONLY when the movement has actually reached t>=1 AND a
-      // full FINAL_HOLD_MS of that landed state has elapsed since the landing
-      // frame AND enough real frames of it have been pushed. Movement time,
-      // camera arrival and frame counts can no longer end the export on their
-      // own — the phase state does.
-      const holdComplete = landed && h >= 1 && holdFramesPushed >= MIN_HOLD_FRAMES;
-      if(!holdComplete){
+      // PHASE D. Stop only once the landing frame AND every hold frame have
+      // actually been rendered and pushed. Termination is now a pure function
+      // of frames emitted: no elapsed-time test can end the export early, and
+      // no camera or encoder timing participates in the decision.
+      if(holdIndex < HOLD_FRAMES){
         requestAnimationFrame(frameStep);
       } else {
         finished = true;
-        // tiny extra delay before stopping so the final frame is flushed/stable
-        setTimeout(()=>{ recorder.stop(); }, 120);
+        // Let the last pushed frames reach the encoder before stopping. The
+        // hold deliberately ends on several identical settled frames, so even
+        // if the encoder drops the very last one the settled state is still
+        // present in the file.
+        setTimeout(()=>{ recorder.stop(); }, Math.max(120, minFrameIntervalMs * 3));
       }
     }
     requestAnimationFrame(frameStep);
