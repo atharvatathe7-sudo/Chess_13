@@ -254,6 +254,7 @@ button:active, button.active {
             <option value="move">Move (drag)</option>
             <option value="arrow">Draw Arrow (Shift+drag)</option>
             <option value="highlight">Highlight (Alt+click)</option>
+            <option value="story">Story Target (click)</option>
           </select>
           <label>Color</label>
           <input id="color" type="color" value="#6b2fa3">
@@ -295,6 +296,16 @@ button:active, button.active {
           <!-- One control: picking the classification also sets its
                conventional symbol (see CLASSIFICATIONS in the script). -->
           <select id="annotationSelect"></select>
+        </div>
+
+        <div class="row" style="flex-wrap:wrap;">
+          <!-- Story Targets: the squares the CREATOR says matter for this
+               move. The camera frames them as the move's consequence. This is
+               a statement of intent, not analysis — nothing here inspects the
+               position. Pick "Story Target" in Mode, then click squares. -->
+          <label class="small">Story targets</label>
+          <span id="storyTargetList" class="small">none</span>
+          <button id="clearStoryTargets">Clear Story Targets</button>
         </div>
 
         <div style="margin-top:8px">
@@ -677,6 +688,21 @@ function redrawOverlay(){
   if(activeRec && activeRec.badge){
     drawBadgeAt(octx, activeRec.to, activeRec.badge);
   }
+  // Story targets: an editing affordance only — a dashed ring so they read as
+  // distinct from highlights (filled) and selection (green). Deliberately NOT
+  // drawn into the export: they tell the camera what to frame, they are not
+  // an annotation the viewer should see.
+  if(activeRec){
+    for(const sq of activeRec.storyTargets){
+      const c = squareToCoords(sq);
+      octx.save();
+      octx.strokeStyle = 'rgba(120, 214, 255, 0.95)';
+      octx.lineWidth = Math.max(3, s * 0.06);
+      octx.setLineDash([s * 0.18, s * 0.12]);
+      octx.strokeRect(c.x + 5, c.y + 5, s - 10, s - 10);
+      octx.restore();
+    }
+  }
   if(selectedSquare){
     const c = squareToCoords(selectedSquare);
     octx.fillStyle = 'rgba(20, 200, 20, 0.5)'; // NEW: Brighter selection
@@ -769,6 +795,49 @@ function squareToCoords(sq){
 }
 function squareCenter(sq){ const c = squareToCoords(sq); const s = LOGICAL_SIZE/8; return {x: c.x + s/2, y: c.y + s/2}; }
 
+/* ---------------- CAMERA FRAMING (one definition) ----------------
+   Turns a set of visual subjects into a single {box, camX, camY} framing:
+   the smallest square frame, in board coordinates, containing every subject
+   square plus the usual half-square margin, centred on them.
+
+   This is THE place a set of subjects becomes a framing. The export's check
+   framing and its Story Target framing both call it, so widening rules stay
+   identical between them instead of each feature growing its own camera
+   geometry. `minBox` is a floor (never frame tighter than this); the board
+   itself is the only ceiling, so genuinely far-apart subjects are allowed to
+   open all the way out to a full-board view rather than being squeezed into
+   an unreadable crop.
+*/
+function framingForCentres(centres, minBox){
+  const s = LOGICAL_SIZE/8, margin = s * 0.5;
+  const xs = [], ys = [];
+  for(const c of centres){
+    if(!c) continue;
+    xs.push(c.x - s/2 - margin, c.x + s/2 + margin);
+    ys.push(c.y - s/2 - margin, c.y + s/2 + margin);
+  }
+  if(!xs.length) return null;
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  return {
+    box: Math.min(LOGICAL_SIZE, Math.max(maxX - minX, maxY - minY, minBox)),
+    camX: (minX + maxX) / 2,
+    camY: (minY + maxY) / 2
+  };
+}
+
+/* Story Targets: the squares the CREATOR marks as the point of this move.
+   Toggled by clicking a square in "Story Target" mode. Stored as algebraic
+   squares on the move record, so they survive selection, undo/redo, timeline
+   and PGN navigation, board flip and export. Nothing here reads the position
+   or evaluates anything — the tool does not analyse chess, it frames what the
+   creator says matters. */
+function toggleStoryTarget(record, sq){
+  const i = record.storyTargets.indexOf(sq);
+  if(i >= 0) record.storyTargets.splice(i, 1);
+  else record.storyTargets.push(sq);
+}
+
 /* ---------------- INTERACTIONS (NEW: Merged Pinch/Pan/Drag/Tap) ---------------- */
 let currentMode = 'move';
 document.getElementById('mode').addEventListener('change', e=>{ currentMode = e.target.value; });
@@ -844,6 +913,16 @@ function onDown(e){
     const rec = getActiveRecord();
     if(!rec){ showMessage('Make a move first to annotate it.', 'error'); return; }
     rec.highlights.push({file:'abcdefgh'.indexOf(sq[0]), rank:8-parseInt(sq[1],10), sq: sq, color: hexToRgba(document.getElementById('color').value,1), alpha:0.28});
+    redrawOverlay();
+    updateHistory();
+    return;
+  }
+  if(currentMode === 'story'){
+    isPanning = false; isPinching = false; dragging = null;
+    if(!sq) return;
+    const rec = getActiveRecord();
+    if(!rec){ showMessage('Make a move first to give it story targets.', 'error'); return; }
+    toggleStoryTarget(rec, sq);
     redrawOverlay();
     updateHistory();
     return;
@@ -1169,7 +1248,8 @@ function buildMoveRecord(m, from, to, preSnapshot, movingBefore){
     annotation: '',                   // human-provided (Phase 3): e.g. "Brilliant" — never computed by the app
     badge: '',                        // human-provided (Phase 3): e.g. "!!" — never computed by the app
     arrows: [],                       // move-scoped arrows (Phase 3): {from,to,color} — belong to THIS ply only
-    highlights: []                    // move-scoped highlights (Phase 3): {file,rank,sq,color,alpha} — belong to THIS ply only
+    highlights: [],                   // move-scoped highlights (Phase 3): {file,rank,sq,color,alpha} — belong to THIS ply only
+    storyTargets: []                  // human-chosen camera subjects (algebraic squares) — what makes THIS move matter
   };
 }
 
@@ -1640,6 +1720,7 @@ document.getElementById('playAnim').addEventListener('click', ()=>{ const rec = 
 document.getElementById('exportAnim').addEventListener('click', ()=>{ const rec = getActiveRecord(); if(!rec){ showMessage('Make a move first (drag a piece). Export records the selected move.', 'error'); return; } exportLastMoveAsWebM(rec, {fps: EXPORT_FPS}); });
 const removeBtn = document.getElementById('removeToggle'); removeBtn.addEventListener('click', ()=>{ removeMode = !removeMode; removeBtn.classList.toggle('active', removeMode); removeBtn.textContent = removeMode ? 'Remove: ON' : 'Remove Piece'; });
 document.getElementById('clearAll').addEventListener('click', ()=>{ const rec=getActiveRecord(); if(rec){ rec.arrows=[]; rec.highlights=[]; } redrawOverlay(); updateHistory(); });
+document.getElementById('clearStoryTargets').addEventListener('click', ()=>{ const rec=getActiveRecord(); if(rec) rec.storyTargets=[]; redrawOverlay(); updateHistory(); });
 
 // NEW (Phase 3): return the board/annotation context to the live position.
 document.getElementById('backToLive').addEventListener('click', ()=>{ if(historyPointer > 0) selectMove(historyPointer); });
@@ -1754,9 +1835,11 @@ function buildClassificationOptions(){
 function updateAnnotationPanel(){
   const labelEl = document.getElementById('selectedMoveLabel');
   const annSel = document.getElementById('annotationSelect');
+  const storyEl = document.getElementById('storyTargetList');
   if(!labelEl || !annSel) return;
   buildClassificationOptions();
   const rec = getActiveRecord();
+  if(storyEl) storyEl.textContent = (rec && rec.storyTargets.length) ? rec.storyTargets.join(' ') : 'none';
   if(!rec){
     labelEl.textContent = 'No move selected';
     annSel.value = ''; annSel.disabled = true;
@@ -2112,21 +2195,23 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     const checkSq = moveRec.checkSquare ? squareCenter(moveRec.checkSquare) : null;
     let holdBox = boxSize, holdCamX = camX1, holdCamY = camY1;
     if(checkSq){
-      const cxs = [endCenter.x - SQ/2 - margin, endCenter.x + SQ/2 + margin, checkSq.x - SQ/2 - margin, checkSq.x + SQ/2 + margin];
-      const cys = [endCenter.y - SQ/2 - margin, endCenter.y + SQ/2 + margin, checkSq.y - SQ/2 - margin, checkSq.y + SQ/2 + margin];
-      // The box that actually contains BOTH the landing square and the
-      // checked king, with the usual half-square margin.
-      const needed = Math.max(Math.max(...cxs) - Math.min(...cxs), Math.max(...cys) - Math.min(...cys));
-      // The ONLY ceiling on the check hold is the board itself: the check
-      // context must be free to open out past the movement framing whenever
-      // the king is further away than the movement box reached, otherwise
-      // the thing the settle exists to show is cropped out of its own beat.
-      // boxSize acts purely as a FLOOR here (with MIN_BOX), so the settle
-      // widens or holds and never tightens back in on the movement framing.
-      holdBox = Math.min(LOGICAL_SIZE, Math.max(needed, MIN_BOX, boxSize));
-      holdCamX = (Math.min(...cxs) + Math.max(...cxs))/2;
-      holdCamY = (Math.min(...cys) + Math.max(...cys))/2;
+      // The framing that contains BOTH the landing square and the checked
+      // king. boxSize acts purely as a FLOOR (with MIN_BOX), so this beat
+      // widens or holds and never tightens back in on the movement framing;
+      // the board is the only ceiling, so a distant king still fits.
+      const f = framingForCentres([endCenter, checkSq], Math.max(MIN_BOX, boxSize));
+      holdBox = f.box; holdCamX = f.camX; holdCamY = f.camY;
     }
+
+    // ---- Consequence framing (human Story Targets) ----
+    // The creator marks the squares that make this move matter. The camera
+    // frames the destination TOGETHER with them, so the payoff stays anchored
+    // to the piece that caused it. Nothing is inferred: with no targets there
+    // is no consequence beat at all and the camera behaves exactly as before.
+    const storyCentres = moveRec.storyTargets.map(sq => squareCenter(sq));
+    const storyFraming = storyCentres.length
+      ? framingForCentres([endCenter].concat(storyCentres), MIN_BOX)
+      : null;
     // PHASE C. Every exported move ends on the same beat: exactly one second
     // of the finished, fully landed position. Previously this was a
     // check-dependent 850/260ms that the export ALSO used as its stop
@@ -2351,6 +2436,55 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     // guaranteed to be encoded across real frames instead of whatever
     // happened to fall inside a wall-clock window.
     const SETTLE_FRAMES   = Math.max(1, Math.round(HOLD_FRAMES * HOLD_SETTLE_FRACTION));
+
+    // ---------------- CAMERA STAGES AFTER LANDING ----------------
+    // A move can have more than one thing worth showing. The hold is an
+    // ordered list of framings; each stage eases from the previous framing
+    // over `ease` frames and then holds still for `hold` frames, all counted
+    // in schedule frames so the sequence is as deterministic as the movement.
+    //
+    //   stage 1  IMPACT       what just happened where it landed — the check
+    //                         relationship when there is one, otherwise the
+    //                         movement framing held still. This is exactly the
+    //                         previous single-stage behaviour.
+    //   stage 2  CONSEQUENCE  only when the creator marked Story Targets: the
+    //                         camera reframes to the destination plus those
+    //                         squares and holds long enough to read them.
+    //
+    // With no Story Targets the list has exactly one stage whose ease/hold are
+    // the previous SETTLE_FRAMES / HOLD_FRAMES-SETTLE_FRAMES, so a move
+    // without them is frame-for-frame identical to before.
+    const STORY_EASE_FRAMES = Math.max(1, Math.round(0.45 * fps));
+    const STORY_HOLD_FRAMES = Math.max(2, Math.round(1.0 * fps));
+    const cameraStages = [
+      { box: holdBox, camX: holdCamX, camY: holdCamY,
+        ease: SETTLE_FRAMES, hold: HOLD_FRAMES - SETTLE_FRAMES }
+    ];
+    if(storyFraming){
+      cameraStages.push({ box: storyFraming.box, camX: storyFraming.camX, camY: storyFraming.camY,
+                          ease: STORY_EASE_FRAMES, hold: STORY_HOLD_FRAMES });
+    }
+    const TOTAL_HOLD_FRAMES = cameraStages.reduce((n, st) => n + st.ease + st.hold, 0);
+
+    // The framing at a given hold frame: walk the stages, easing between each
+    // stage's framing and the one before it. Hold frame 0 is the landing
+    // frame, which always sits on the movement framing — so no consequence or
+    // check framing can ever begin before the piece is rendered settled.
+    function framingAtHold(holdIdx, fromBox, fromCamX, fromCamY){
+      let box = fromBox, cx = fromCamX, cy = fromCamY, k = holdIdx;
+      for(const st of cameraStages){
+        if(k <= st.ease){
+          const e = easeInOutCubic(k / st.ease);
+          return { box: box + (st.box - box)*e, camX: cx + (st.camX - cx)*e, camY: cy + (st.camY - cy)*e };
+        }
+        k -= st.ease;
+        if(k <= st.hold) return { box: st.box, camX: st.camX, camY: st.camY };
+        k -= st.hold;
+        box = st.box; cx = st.camX; cy = st.camY;
+      }
+      return { box, camX: cx, camY: cy };
+    }
+
     let frameIndex = 0;   // 0..MOVEMENT_FRAMES-1 movement, ==MOVEMENT_FRAMES landing, beyond it hold
     let lastPushedAt = -Infinity;
     let finished = false;
@@ -2372,12 +2506,10 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       const t = Math.min(1, frameIndex / MOVEMENT_FRAMES);
       const landed = frameIndex >= MOVEMENT_FRAMES;
       const holdIndex = landed ? (frameIndex - MOVEMENT_FRAMES) : -1;
-      // Hold progress and camera settle progress, both counted in FRAMES from
-      // the landing frame. The landing frame itself is holdIndex 0, so the
-      // check context can never begin before the piece has been rendered
-      // settled on its destination.
-      const h = landed ? Math.min(1, holdIndex / HOLD_FRAMES) : 0;
-      const settleProgress = landed ? Math.min(1, holdIndex / SETTLE_FRAMES) : 0;
+      // Hold progress, counted in FRAMES from the landing frame. The landing
+      // frame itself is holdIndex 0, so no end framing can begin before the
+      // piece has been rendered settled on its destination.
+      const h = landed ? Math.min(1, holdIndex / TOTAL_HOLD_FRAMES) : 0;
 
       // 1. Draw the board, static pieces, and overlays
       drawBoardToTemp(landed);
@@ -2437,16 +2569,14 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       const camX = camX0 + (camX1 - camX0) * prog;
       const camY = camY0 + (camY1 - camY0) * prog;
 
-      // Ease toward the end framing during the hold (only differs from the
-      // movement framing when this move gives check). Driven by
-      // settleProgress, which completes partway into the hold, so the check
-      // context arrives and is then HELD still — never arriving exactly as
-      // the recorder stops. It is zero for every frame before landing, so
-      // the check state cannot begin while the piece is still in transit.
-      const settle = easeInOutCubic(settleProgress);
-      const frameBox = boxSize + (holdBox - boxSize) * settle;
-      const frameCamX = camX + (holdCamX - camX) * settle;
-      const frameCamY = camY + (holdCamY - camY) * settle;
+      // While the piece is travelling the camera is the movement camera. Once
+      // landed, walk the camera stages (impact, then the consequence beat when
+      // the creator marked Story Targets). Each stage eases in and is then
+      // HELD still, so a framing never arrives just as the recorder stops.
+      const framing = landed
+        ? framingAtHold(holdIndex, boxSize, camX, camY)
+        : { box: boxSize, camX, camY };
+      const frameBox = framing.box, frameCamX = framing.camX, frameCamY = framing.camY;
 
       // Compute crop (ensure crop fits inside board)
       const half = frameBox / 2;
@@ -2486,7 +2616,7 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       // actually been rendered and pushed. Termination is now a pure function
       // of frames emitted: no elapsed-time test can end the export early, and
       // no camera or encoder timing participates in the decision.
-      if(holdIndex < HOLD_FRAMES){
+      if(holdIndex < TOTAL_HOLD_FRAMES){
         requestAnimationFrame(frameStep);
       } else {
         finished = true;
