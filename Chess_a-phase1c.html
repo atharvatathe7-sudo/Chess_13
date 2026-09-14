@@ -661,32 +661,41 @@ function glyphFor(type,color){
 }
 
 /* ---------------- OVERLAY (MODIFIED for Pan/Zoom) ---------------- */
-function redrawOverlay(){
+// `landed` gates the three POST-MOVE ANNOTATION graphics (highlight, arrow,
+// badge) only — everything else redrawOverlay() draws (story targets,
+// selection/legal-move dots) is unaffected. Defaults to true so every
+// existing call site (selecting a move, adding/clearing an annotation,
+// undo/redo, flip, etc.) keeps showing annotations exactly as before; the
+// ONLY caller that ever passes false is animPiece()'s own per-frame loop,
+// while its local `t` is still short of the piece's landing.
+function redrawOverlay(landed = true){
   octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE);
-  
+
   octx.save();
   // NEW: Apply pan/zoom to the overlay canvas
   octx.translate(viewTransform.panX, viewTransform.panY);
   octx.scale(viewTransform.scale, viewTransform.scale);
-  
+
   const s = LOGICAL_SIZE/8;
   // Move-scoped: only the active record's (selected, or latest-move-by-
   // default) arrows/highlights are shown — see getActiveRecord().
   const activeRec = getActiveRecord();
   const activeHighlights = activeRec ? activeRec.highlights : [];
   const activeArrows = activeRec ? activeRec.arrows : [];
-  for(const h of activeHighlights){
-    const visFile = boardFlipped ? (7 - h.file) : h.file;
-    const visRank = boardFlipped ? (7 - h.rank) : h.rank;
-    octx.fillStyle = h.color; octx.globalAlpha = h.alpha; octx.fillRect(visFile*s+4, visRank*s+4, s-8, s-8); octx.globalAlpha = 1;
-  }
-  for(const a of activeArrows){
-    const from = squareCenter(a.from);
-    const to = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
-    drawArrow(octx, from, to, a.color, Math.max(4, LOGICAL_SIZE*0.01));
-  }
-  if(activeRec && activeRec.badge){
-    drawBadgeAt(octx, activeRec.to, activeRec.badge);
+  if(landed){
+    for(const h of activeHighlights){
+      const visFile = boardFlipped ? (7 - h.file) : h.file;
+      const visRank = boardFlipped ? (7 - h.rank) : h.rank;
+      octx.fillStyle = h.color; octx.globalAlpha = h.alpha; octx.fillRect(visFile*s+4, visRank*s+4, s-8, s-8); octx.globalAlpha = 1;
+    }
+    for(const a of activeArrows){
+      const from = squareCenter(a.from);
+      const to = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
+      drawArrow(octx, from, to, a.color, Math.max(4, LOGICAL_SIZE*0.01));
+    }
+    if(activeRec && activeRec.badge){
+      drawBadgeAt(octx, activeRec.to, activeRec.badge);
+    }
   }
   // Story targets: an editing affordance only — a dashed ring so they read as
   // distinct from highlights (filled) and selection (green). Deliberately NOT
@@ -1557,7 +1566,7 @@ function animPiece(type,start,end,img,duration,onComplete){
   function frame(now){
     if(t0 === null) t0 = now;
     const t = Math.min(1, (now - t0)/duration);
-    drawBoard(); redrawOverlay();
+    drawBoard(); redrawOverlay(t >= 1);
     octx.globalAlpha = 1;
     const st = pieceTrajectory(type, start, end, t);
     drawLiveDecoration(type, start, end, st, t);
@@ -2256,7 +2265,8 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       }
     }
 
-    function drawOverlayElementsToTemp(targetCtx){
+    function drawOverlayElementsToTemp(targetCtx, landed){
+      if(!landed) return;
       const s = LOGICAL_SIZE/8;
       for(const h of recHighlights){
         const vf = boardFlipped ? (7 - h.file) : h.file;
@@ -2291,7 +2301,7 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       // landed it's cleared along with the mover's own origin square(s).
       drawPiecesFromSnapshotTo(tctx, landed ? preSnapshotLanded : preSnapshotDuringMove);
       // draw arrows & highlights
-      drawOverlayElementsToTemp(tctx);
+      drawOverlayElementsToTemp(tctx, landed);
     }
 
     // -------------------------------------------------
