@@ -259,6 +259,16 @@ button:active, button.active {
           <label>Color</label>
           <input id="color" type="color" value="#6b2fa3">
           <button id="clearAll">Clear</button>
+          <label>Capture FX</label>
+          <select id="captureFx">
+            <option value="off">Off</option>
+            <option value="dissolve" selected>Dissolve</option>
+            <option value="shatter">Shatter</option>
+            <option value="energy">Energy Dissolve</option>
+            <option value="implosion">Implosion</option>
+            <option value="drift">Directional Dissolve</option>
+            <option value="burst">Impact Burst</option>
+          </select>
         </div>
 
         <div class="row controls-flex">
@@ -804,6 +814,201 @@ function squareToCoords(sq){
 }
 function squareCenter(sq){ const c = squareToCoords(sq); const s = LOGICAL_SIZE/8; return {x: c.x + s/2, y: c.y + s/2}; }
 
+/* ---------------- CAPTURE EFFECTS (captured-piece destruction) ----------
+   Six fixed cinematic behaviours for the piece that was just taken. The
+   CAPTURING piece is never touched by any of this: it travels its normal
+   trajectory, lands normally, and is drawn on top of the effect, so a
+   capture still reads as "this piece took that one".
+
+   Everything below is a pure function of (progress, fragment index,
+   per-capture seed). No Math.random, no clock reads, no accumulated state
+   — export drives `progress` from holdIndex and the live preview from its
+   own frame counter, so both show the same beat and repeated exports of
+   the same move are identical.
+
+   Fragments are sub-rectangles of the victim's OWN image, so at progress 0
+   they reassemble it exactly: the piece is recognisably itself on the
+   landing frame and only then comes apart.
+
+   Drawing happens in the same 0..LOGICAL_SIZE board space the board uses,
+   which makes this flip-safe (squareCenter() already resolves
+   boardFlipped) and camera-safe (the export applies its crop afterwards,
+   and the camera box is never computed from anything here). */
+const CAPTURE_FX_FRAMES = 15;   // ~0.5s at EXPORT_FPS, always carved out of the existing hold
+let captureEffect = 'dissolve'; // set by the Capture FX control; 'off' disables entirely
+
+// Deterministic [0,1) from integer inputs — integer ops only, so it is
+// stable across runs, machines and idle-vs-stalled rendering.
+function fxRand(seed, i, salt){
+  let h = (seed ^ Math.imul(i + 1, 374761393) ^ Math.imul(salt + 1, 668265263)) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+// Seeded from the capture's own identity, so the same capture always
+// shatters the same way and a different one does not.
+function fxSeedFor(record, sq){
+  const s = (record.color || 'w') + (record.captured || '') + sq + ':' + (record.ply || 0);
+  let h = 2166136261 >>> 0;
+  for(let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
+  return h >>> 0;
+}
+// Per-fragment progress: each fragment waits out its own small delay before
+// it starts, which is what stops the piece coming apart as one rigid block.
+function fxStagger(p, delay){
+  const span = 1 - delay;
+  return span <= 0 ? 1 : Math.max(0, Math.min(1, (p - delay) / span));
+}
+// What a capture destroys, and the square it actually stands on. For en
+// passant that is the pawn's own square, NOT the move's destination.
+function captureVictim(record){
+  if(!record || !record.captured) return null;
+  const sq = (record.isEnPassant && record.extraVacate && record.extraVacate[0])
+    ? record.extraVacate[0] : record.to;
+  return { sq: sq, type: record.captured, color: record.color === 'w' ? 'b' : 'w' };
+}
+// Directional Dissolve drifts along the capture itself — the victim is
+// carried off the way the capturing piece came in. Taken from the move's
+// own geometry (and therefore flip-aware, since squareCenter is), so it
+// needs no configuration.
+function captureDriftDir(record){
+  const a = squareCenter(record.from), b = squareCenter(record.to);
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  return len < 1e-6 ? {x: 0, y: -1} : {x: dx/len, y: dy/len};
+}
+
+function drawCaptureEffect(targetCtx, effect, victim, progress, seed, dir){
+  if(!victim || !effect || effect === 'off') return;
+  const p = progress;
+  if(!(p >= 0) || p >= 1) return;          // nothing before the beat, nothing after it
+  const img = (pieceImages[victim.color] || {})[victim.type];
+  if(!img || !img.complete) return;
+
+  const s = LOGICAL_SIZE / 8;
+  const c = squareCenter(victim.sq);
+  const size = s * PIECE_SCALE;
+  // Fewer, bigger fragments read as shards; many small ones read as dust.
+  const grid = effect === 'shatter' ? 4 : effect === 'burst' ? 6 : effect === 'implosion' ? 8 : 10;
+  const cell = size / grid;
+  const src = (img.naturalWidth || 600) / grid;
+  const seam = cell * 0.04;                // hides tile seams while the piece is still whole
+
+  targetCtx.save();
+
+  // Impact Burst opens on a flash at the point of contact.
+  if(effect === 'burst'){
+    const fp = Math.min(1, p / 0.35);
+    if(fp < 1){
+      const rad = s * (0.45 + 0.95 * fp);
+      const a = (1 - fp) * 0.8;
+      const g = targetCtx.createRadialGradient(c.x, c.y, 0, c.x, c.y, rad);
+      g.addColorStop(0, 'rgba(255,248,225,' + a.toFixed(3) + ')');
+      g.addColorStop(0.55, 'rgba(255,201,120,' + (a * 0.45).toFixed(3) + ')');
+      g.addColorStop(1, 'rgba(255,170,80,0)');
+      targetCtx.save();
+      targetCtx.globalCompositeOperation = 'lighter';
+      targetCtx.fillStyle = g;
+      targetCtx.beginPath(); targetCtx.arc(c.x, c.y, rad, 0, Math.PI * 2); targetCtx.fill();
+      targetCtx.restore();
+    }
+  }
+
+  for(let gy = 0; gy < grid; gy++){
+    for(let gx = 0; gx < grid; gx++){
+      const i = gy * grid + gx;
+      const r1 = fxRand(seed, i, 1), r2 = fxRand(seed, i, 2), r3 = fxRand(seed, i, 3);
+      const fx = (gx + 0.5) * cell - size / 2;   // fragment centre, relative to the piece centre
+      const fy = (gy + 0.5) * cell - size / 2;
+      let dx = 0, dy = 0, rot = 0, sc = 1, alpha = 1, k;
+
+      if(effect === 'shatter'){
+        k = fxStagger(p, 0.10 * r1);
+        const ang = Math.atan2(fy, fx) + (r2 - 0.5) * 0.5;
+        const spd = (0.55 + 0.55 * r1) * s;
+        dx = Math.cos(ang) * spd * k;
+        dy = Math.sin(ang) * spd * k + 0.9 * s * k * k;   // shards fall as they fly
+        rot = (r2 - 0.5) * 2.4 * k;
+        sc = 1 - 0.15 * k;
+        alpha = 1 - k * k;                                 // stay solid, fade late
+      } else if(effect === 'energy'){
+        k = fxStagger(p, 0.22 * r1);
+        dx = (r2 - 0.5) * s * 0.30 * k;
+        dy = -s * 0.95 * k - r3 * 0.4 * s * k * k;
+        sc = 1 - 0.7 * k;
+        alpha = 1 - k;
+      } else if(effect === 'implosion'){
+        k = fxStagger(p, 0.08 * r1);
+        const e = k * k * (3 - 2 * k);                     // smoothstep collapse
+        dx = -fx * e; dy = -fy * e;
+        rot = (r1 < 0.5 ? -1 : 1) * 1.4 * e;
+        sc = 1 - 0.85 * e;
+        alpha = 1 - e * e * e;                             // holds together, then goes
+      } else if(effect === 'drift'){
+        const proj = (fx * dir.x + fy * dir.y) / (size / 2);
+        k = fxStagger(p, 0.30 * (0.5 - proj * 0.5));       // trailing edge leaves first
+        dx = dir.x * s * 1.25 * k + (r2 - 0.5) * cell * 0.5 * k;
+        dy = dir.y * s * 1.25 * k + (r3 - 0.5) * cell * 0.5 * k;
+        rot = (r1 - 0.5) * 0.8 * k;
+        sc = 1 - 0.45 * k;
+        alpha = 1 - k;
+      } else if(effect === 'burst'){
+        k = fxStagger(p, 0.06 * r1);
+        const ang = Math.atan2(fy, fx) + (r2 - 0.5) * 0.4;
+        const spd = (1.0 + 0.8 * r1) * s;
+        dx = Math.cos(ang) * spd * k;
+        dy = Math.sin(ang) * spd * k;
+        rot = (r2 - 0.5) * 3.0 * k;
+        sc = 1 - 0.5 * k;
+        alpha = 1 - k;
+      } else {                                             // 'dissolve' (default)
+        // Restrained, but it has to actually come APART: displacement is
+        // scaled to the SQUARE, not the fragment, and fragments shrink to
+        // near-dust, otherwise the top of a tall piece just slides upward
+        // as one recognisable block.
+        k = fxStagger(p, 0.22 * r1);
+        dx = (r2 - 0.5) * s * 0.50 * k;
+        dy = -s * 0.42 * k + (r3 - 0.5) * s * 0.28 * k;
+        rot = (r1 - 0.5) * 1.6 * k;
+        sc = 1 - 0.8 * k;
+        alpha = 1 - k;
+      }
+
+      if(alpha <= 0.004 || sc <= 0.03) continue;
+      const d = cell * sc + seam;
+      targetCtx.save();
+      targetCtx.globalAlpha = Math.max(0, Math.min(1, alpha));
+      targetCtx.translate(c.x + fx + dx, c.y + fy + dy);
+      if(rot) targetCtx.rotate(rot);
+      targetCtx.drawImage(img, gx * src, gy * src, src, src, -d/2, -d/2, d, d);
+      targetCtx.restore();
+    }
+  }
+
+  // Energy Dissolve adds rising motes so the piece reads as being erased
+  // into light rather than simply blown apart.
+  if(effect === 'energy'){
+    targetCtx.globalCompositeOperation = 'lighter';
+    for(let m = 0; m < 14; m++){
+      const r1 = fxRand(seed, m, 11), r2 = fxRand(seed, m, 12), r3 = fxRand(seed, m, 13);
+      const k = fxStagger(p, 0.15 * r1);
+      if(k <= 0 || k >= 1) continue;
+      const bx = c.x + (r2 - 0.5) * size * 0.55;
+      const by = c.y + (r3 - 0.5) * size * 0.6 - s * 1.05 * k;
+      const rad = cell * (0.55 - 0.3 * k);
+      const a = Math.sin(Math.PI * k) * 0.85;
+      if(rad <= 0 || a <= 0.01) continue;
+      const g = targetCtx.createRadialGradient(bx, by, 0, bx, by, rad);
+      g.addColorStop(0, 'rgba(198,242,255,' + a.toFixed(3) + ')');
+      g.addColorStop(1, 'rgba(120,200,255,0)');
+      targetCtx.globalAlpha = 1;
+      targetCtx.fillStyle = g;
+      targetCtx.beginPath(); targetCtx.arc(bx, by, rad, 0, Math.PI * 2); targetCtx.fill();
+    }
+  }
+
+  targetCtx.restore();
+}
+
 /* ---------------- CAMERA FRAMING (one definition) ----------------
    Turns a set of visual subjects into a single {box, camX, camY} framing:
    the smallest square frame, in board coordinates, containing every subject
@@ -1302,14 +1507,25 @@ function boardAfterPly(ply){
 }
 
 // A clone of `record.preSnapshot` with every square that must not show a
-// static piece during that move's animation cleared (the same squares
-// exportLastMoveAsWebM vacates: the mover's origin, castling's rook
-// origin, en passant's captured-pawn square). Shared by the historical
-// preview path (playRecordAnimation) and export, so both start an
-// animation from the identical base state.
+// static piece once that move has LANDED cleared: the mover's origin,
+// the DESTINATION square, castling's rook origin, and en passant's
+// captured-pawn square. Shared by the historical preview path
+// (playRecordAnimation) and export, so both start an animation from the
+// identical base state.
+//
+// `to` is in that list because the arriving piece is always drawn as a
+// moving piece on top of this snapshot, never from it — so the snapshot
+// must not also carry whatever stood on `to` beforehand. For an ordinary
+// capture that "whatever" is the captured piece, and leaving it in place
+// relied on the arriving piece's own artwork happening to cover it. It
+// does not: every piece type has a different silhouette inside the same
+// bounding box, so the captured piece stayed visible around the edges of
+// the piece that took it (a pawn taking a knight left the knight's ears
+// showing). For a non-capturing move `to` is empty in preSnapshot anyway,
+// so clearing it is a no-op there.
 function vacatedSnapshot(record){
   const snap = JSON.parse(JSON.stringify(record.preSnapshot || game.board()));
-  const squares = [record.from].concat(record.secondary ? [record.secondary.from] : []).concat(record.extraVacate || []);
+  const squares = [record.from, record.to].concat(record.secondary ? [record.secondary.from] : []).concat(record.extraVacate || []);
   for(const sqName of squares){
     const f = 'abcdefgh'.indexOf(sqName[0]);
     const r = 8 - parseInt(sqName[1]);
@@ -1408,6 +1624,42 @@ function computeMoveDuration(record, baseDuration){
   return Math.round(Math.min(MAX_DURATION_MS, Math.max(baseDuration, scaled)));
 }
 
+// Live-preview counterpart of the export's capture beat: same
+// drawCaptureEffect(), same CAPTURE_FX_FRAMES budget, same frame-index
+// progression — only the surface differs (overlay canvas here, export temp
+// canvas there), which is what keeps preview and export showing the same
+// thing. onComplete still fires at LANDING, so annotations, history and
+// status update exactly when they always did; the effect is drawn after it
+// in the same tick, so the arriving piece never blinks.
+function runCaptureEffectPreview(record, victim, toHide, onComplete){
+  const seed = fxSeedFor(record, victim.sq);
+  const dir = captureDriftDir(record);
+  const end = squareCenter(record.to);
+  const landedImg = (pieceImages[record.color] || {})[record.resultPieceType] || null;
+  const secEnd = record.secondary ? squareCenter(record.secondary.to) : null;
+  const secImg = record.secondary ? (pieceImages[record.secondary.color] || {})[record.secondary.type] : null;
+  if(onComplete) onComplete();
+  let f = 0;
+  function paint(){
+    drawBoard();
+    redrawOverlay();
+    octx.save();
+    octx.translate(viewTransform.panX, viewTransform.panY);
+    octx.scale(viewTransform.scale, viewTransform.scale);
+    drawCaptureEffect(octx, captureEffect, victim, f / CAPTURE_FX_FRAMES, seed, dir);
+    octx.restore();
+    octx.globalAlpha = 1;
+    drawMovingImage(landedImg, end.x, end.y, 1, 0, true);
+    if(secImg) drawMovingImage(secImg, secEnd.x, secEnd.y, 1, 0, true);
+    f++;
+    if(f <= CAPTURE_FX_FRAMES){ requestAnimationFrame(paint); return; }
+    toHide.forEach(sq => animHideSquares.delete(sq));
+    octx.clearRect(0,0,LOGICAL_SIZE,LOGICAL_SIZE);
+    drawBoard(); redrawOverlay();
+  }
+  paint();
+}
+
 function animateRecord(record, onComplete){
   if(!record){ if(onComplete) onComplete(); return; }
   const toHide = record.secondary ? [record.to, record.secondary.to] : [record.to];
@@ -1417,6 +1669,15 @@ function animateRecord(record, onComplete){
   function settle(){
     pending--;
     if(pending === 0){
+      // A capture plays its destruction beat here — the same beat the export
+      // spends on the front of its hold. The mover's destination stays in
+      // animHideSquares for its duration so the effect can be drawn UNDER
+      // the arriving piece exactly the way the export layers it.
+      const victim = captureVictim(record);
+      if(victim && captureEffect !== 'off'){
+        runCaptureEffectPreview(record, victim, toHide, onComplete);
+        return;
+      }
       toHide.forEach(sq => animHideSquares.delete(sq));
       if(onComplete) onComplete();
     }
@@ -1722,6 +1983,7 @@ document.getElementById('importPgn').addEventListener('click', ()=>{
   importPgn(document.getElementById('pgnInput').value);
 });
 document.getElementById('flip').addEventListener('click', ()=>{ boardFlipped = !boardFlipped; drawBoard(); redrawOverlay(); });
+document.getElementById('captureFx').addEventListener('change', (e)=>{ captureEffect = e.target.value; });
 // Play/Export operate on the ACTIVE record — the selected timeline move if
 // one is selected, else the latest move (getActiveRecord()'s default) —
 // so previewing/exporting an older move works exactly like the latest one.
@@ -2017,15 +2279,15 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     // captured pawn is NOT visible during the export"). vacatedSnapshot()
     // (shared with the historical live-preview path) clears the primary
     // piece's origin, castling's rook origin, AND extraVacate (en passant's
-    // captured-pawn square, which is not the destination square) — correct
-    // for the LANDED board, but clearing extraVacate from frame one erases
-    // the captured pawn for the entire clip, before the capture has
-    // visually happened. During the movement phase only the ORIGIN squares
-    // (this piece's `from`, and castling's rook `from`) are cleared, so the
-    // en passant target square keeps showing its pawn until landing. A
-    // plain capture needs no such handling — the captured piece sits at
-    // `to`, which neither snapshot ever clears, and is naturally covered
-    // once the arriving piece is drawn there.
+    // captured-pawn square, which is not the destination square) AND the
+    // destination square itself — correct for the LANDED board, but
+    // clearing those from frame one would erase, for the entire clip,
+    // pieces the capture has not visually taken yet. During the movement
+    // phase only the ORIGIN squares (this piece's `from`, and castling's
+    // rook `from`) are cleared, so BOTH an ordinary capture's victim on
+    // `to` and en passant's pawn on its own square keep standing right up
+    // to the moment of landing, and vanish exactly when the capture
+    // visually happens.
     function snapshotClearing(squares){
       const snap = JSON.parse(JSON.stringify(moveRec.preSnapshot || game.board()));
       for(const sqName of squares){
@@ -2441,6 +2703,17 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     // longer make it incomplete.
     const MOVEMENT_FRAMES = Math.max(2, Math.round((duration / 1000) * fps));
     const HOLD_FRAMES     = Math.max(2, Math.round((FINAL_HOLD_MS / 1000) * fps));
+    // The captured piece's destruction beat is CARVED OUT of the front of
+    // the hold that already exists — it never adds frames. MOVEMENT_FRAMES,
+    // HOLD_FRAMES, SETTLE_FRAMES, TOTAL_HOLD_FRAMES and the termination test
+    // below are all untouched, so turning an effect on cannot change how
+    // long the clip is. Read once here, not per frame, so a clip is rendered
+    // with one consistent effect.
+    const fxKind   = captureEffect;
+    const fxVictim = captureVictim(moveRec);
+    const fxSeed   = fxVictim ? fxSeedFor(moveRec, fxVictim.sq) : 0;
+    const fxDir    = captureDriftDir(moveRec);
+    const FX_FRAMES = Math.max(1, Math.min(CAPTURE_FX_FRAMES, HOLD_FRAMES - 1));
     // Frames of the hold spent easing into the check context; the rest are
     // fully settled. Both are frame counts now, so the check context is
     // guaranteed to be encoded across real frames instead of whatever
@@ -2550,6 +2823,15 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
         secondaryState = landed
           ? {x: secondaryEndCenter.x, y: secondaryEndCenter.y, angle: 0, scale: 1, e: 1}
           : pieceTrajectory(secondary.type, secondaryStartCenter, secondaryEndCenter, t);
+      }
+
+      // 2b. The captured piece's destruction beat, drawn on the static board
+      //     but UNDER the arriving piece, so the capture still reads as one
+      //     piece taking another. Driven by holdIndex alone: at holdIndex 0
+      //     the victim is still whole, and once the beat is over it is gone
+      //     for the entire remainder of the hold.
+      if(landed && fxVictim && fxKind !== 'off'){
+        drawCaptureEffect(tctx, fxKind, fxVictim, holdIndex / FX_FRAMES, fxSeed, fxDir);
       }
 
       // 3. Draw the moving piece(s) on top of the context. A promotion only
