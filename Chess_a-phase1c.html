@@ -257,7 +257,7 @@ button:active, button.active {
             <option value="story">Story Target (click)</option>
           </select>
           <label>Color</label>
-          <input id="color" type="color" value="#6b2fa3">
+          <input id="color" type="color" value="#FFC857">
           <button id="clearAll">Clear</button>
           <label>Capture FX</label>
           <select id="captureFx">
@@ -465,13 +465,18 @@ function makePieceSvgData(type, color){
         <circle cx="300" cy="298" r="58" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
       `;
       break;
-    case 'b': // bishop: shoulder + tapered body + mitre dome with diagonal slit + finial
+    case 'b': // bishop: shoulder + tapered body + mitre dome with a bold
+              // diagonal cut (the piece's one unmistakable cue) + finial.
+              // The cut is drawn as a thick capsule in the outline colour
+              // with a thin fill-coloured edge around it, so it reads as a
+              // carved notch rather than a stray line at small size, and
+              // stays legible on both light and dark pieces.
       body = `
         <ellipse cx="300" cy="392" rx="58" ry="38" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
         <rect x="266" y="270" width="68" height="130" rx="32" ry="32" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
-        <ellipse cx="300" cy="225" rx="44" ry="54" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
-        <rect x="297" y="178" width="6" height="70" rx="3" fill="${stroke}" transform="rotate(-32 300 213)"/>
-        <circle cx="300" cy="150" r="18" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <ellipse cx="300" cy="223" rx="47" ry="58" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="287" y="169" width="26" height="88" rx="13" fill="${stroke}" stroke="${fill}" stroke-width="4" transform="rotate(-34 300 213)"/>
+        <circle cx="300" cy="147" r="19" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
       `;
       break;
     case 'n': // knight: stylized low-poly horse head/neck, facing left, plus ear + eye
@@ -490,15 +495,21 @@ function makePieceSvgData(type, color){
         <rect x="334" y="196" width="30" height="58" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
       `;
       break;
-    case 'q': // queen: shoulder + body + coronet band + three-point crown with pearls
+    case 'q': // queen: shoulder + body + coronet band + five-point crown
+              // with pearls. Five sharp, deeply-separated points (rather
+              // than the previous three shallow ones) is what reads as
+              // "crown" in silhouette alone at small size, distinct from
+              // the bishop's single smooth dome.
       body = `
         <ellipse cx="300" cy="400" rx="56" ry="34" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
         <rect x="258" y="268" width="84" height="140" rx="30" ry="30" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
-        <rect x="230" y="232" width="140" height="34" rx="10" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
-        <polygon points="230,232 248,166 268,206 300,140 332,206 352,166 370,232" fill="${fill}" stroke="${stroke}" stroke-width="${sw}" stroke-linejoin="round"/>
-        <circle cx="248" cy="160" r="11" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
-        <circle cx="300" cy="134" r="13" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
-        <circle cx="352" cy="160" r="11" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <rect x="228" y="232" width="144" height="34" rx="10" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <polygon points="228,232 240,182 257,214 272,142 288,202 300,118 312,202 328,142 343,214 360,182 372,232" fill="${fill}" stroke="${stroke}" stroke-width="${sw}" stroke-linejoin="round"/>
+        <circle cx="240" cy="176" r="12" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <circle cx="272" cy="136" r="13" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <circle cx="300" cy="112" r="15" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <circle cx="328" cy="136" r="13" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+        <circle cx="360" cy="176" r="12" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
       `;
       break;
     case 'k': // king: shoulder + body + flat coronet band + cross finial
@@ -670,6 +681,62 @@ function glyphFor(type,color){
   return map[type][color];
 }
 
+function roundedRectPath(c, x, y, w, h, r){
+  c.beginPath();
+  c.moveTo(x+r, y);
+  c.lineTo(x+w-r, y);
+  c.arcTo(x+w, y, x+w, y+r, r);
+  c.lineTo(x+w, y+h-r);
+  c.arcTo(x+w, y+h, x+w-r, y+h, r);
+  c.lineTo(x+r, y+h);
+  c.arcTo(x, y+h, x, y+h-r, r);
+  c.lineTo(x, y+r);
+  c.arcTo(x, y, x+r, y, r);
+  c.closePath();
+}
+
+// "Cinematic perimeter glow": a luminous border hugging the four edges of
+// the square, with a soft outer glow and a faint inner halo bleeding
+// slightly inward — the centre stays clear so the piece and board read
+// through it. A dark backing pass underneath the colour keeps the border
+// visible on both the green and cream squares (a light amber border alone
+// can wash out against cream). Shared by the live overlay and the export's
+// temp-canvas overlay so both render identically. `x,y` is the square's
+// top-left corner in the same 0..LOGICAL_SIZE space both callers already
+// use; `size` is the square width.
+function drawHighlightAt(ctxTarget, x, y, size, color){
+  const r = size * 0.10;
+  ctxTarget.save();
+
+  // 1. Dark contrast backing.
+  roundedRectPath(ctxTarget, x + size*0.045, y + size*0.045, size*0.91, size*0.91, r);
+  ctxTarget.lineWidth = size * 0.075;
+  ctxTarget.strokeStyle = 'rgba(8,7,5,0.5)';
+  ctxTarget.shadowBlur = 0;
+  ctxTarget.globalAlpha = 1;
+  ctxTarget.stroke();
+
+  // 2. Soft inner halo, inset further so it only grazes the interior.
+  roundedRectPath(ctxTarget, x + size*0.15, y + size*0.15, size*0.70, size*0.70, r*0.75);
+  ctxTarget.lineWidth = size * 0.02;
+  ctxTarget.strokeStyle = color;
+  ctxTarget.shadowColor = color;
+  ctxTarget.shadowBlur = size * 0.30;
+  ctxTarget.globalAlpha = 0.5;
+  ctxTarget.stroke();
+
+  // 3. Crisp perimeter border — the main marker, with its own outer glow.
+  roundedRectPath(ctxTarget, x + size*0.06, y + size*0.06, size*0.88, size*0.88, r);
+  ctxTarget.lineWidth = size * 0.045;
+  ctxTarget.strokeStyle = color;
+  ctxTarget.shadowColor = color;
+  ctxTarget.shadowBlur = size * 0.16;
+  ctxTarget.globalAlpha = 0.95;
+  ctxTarget.stroke();
+
+  ctxTarget.restore();
+}
+
 /* ---------------- OVERLAY (MODIFIED for Pan/Zoom) ---------------- */
 // `landed` gates the three POST-MOVE ANNOTATION graphics (highlight, arrow,
 // badge) only — everything else redrawOverlay() draws (story targets,
@@ -696,12 +763,12 @@ function redrawOverlay(landed = true){
     for(const h of activeHighlights){
       const visFile = boardFlipped ? (7 - h.file) : h.file;
       const visRank = boardFlipped ? (7 - h.rank) : h.rank;
-      octx.fillStyle = h.color; octx.globalAlpha = h.alpha; octx.fillRect(visFile*s+4, visRank*s+4, s-8, s-8); octx.globalAlpha = 1;
+      drawHighlightAt(octx, visFile*s, visRank*s, s, h.color);
     }
     for(const a of activeArrows){
       const from = squareCenter(a.from);
       const to = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
-      drawArrow(octx, from, to, a.color, Math.max(4, LOGICAL_SIZE*0.01));
+      drawArrow(octx, from, to, a.color);
     }
     if(activeRec && activeRec.badge){
       drawBadgeAt(octx, activeRec.to, activeRec.badge);
@@ -745,18 +812,49 @@ function redrawOverlay(landed = true){
   octx.restore();
 }
 
-function drawArrow(ctxA, from, to, color, width=6){
+// Cinematic annotation arrow: a substantially thicker rounded shaft and a
+// strong, slightly-softened arrowhead, sized proportionally to the board
+// square (not a fixed pixel width) so it stays readable under camera zoom,
+// on export, and at normal short-form viewing size. A dark backing pass
+// underneath the colour keeps it legible over both board colours and any
+// piece it crosses. `width` is no longer meaningful as a caller override —
+// this arrow's proportions are now always derived from the square size, so
+// callers are free to omit it.
+function drawArrow(ctxA, from, to, color){
   if(!from || !to) return;
-  const head = Math.max(10, LOGICAL_SIZE*0.02);
-  ctxA.lineWidth = width; ctxA.strokeStyle = color; ctxA.fillStyle = color; ctxA.lineCap='round';
-  ctxA.globalAlpha = 0.75; // NEW: Added transparency
-  ctxA.beginPath(); ctxA.moveTo(from.x, from.y); ctxA.lineTo(to.x, to.y); ctxA.stroke();
-  const dx = to.x - from.x, dy = to.y - from.y; const ang = Math.atan2(dy,dx);
-  ctxA.beginPath(); ctxA.moveTo(to.x, to.y);
-  ctxA.lineTo(to.x - head*Math.cos(ang - Math.PI/6), to.y - head*Math.sin(ang - Math.PI/6));
-  ctxA.lineTo(to.x - head*Math.cos(ang + Math.PI/6), to.y - head*Math.sin(ang + Math.PI/6));
-  ctxA.closePath(); ctxA.fill();
-  ctxA.globalAlpha = 1.0;
+  const dx = to.x - from.x, dy = to.y - from.y;
+  const dist = Math.hypot(dx, dy);
+  if(dist < 1) return;
+  const ang = Math.atan2(dy, dx);
+  const s = LOGICAL_SIZE / 8;
+  const shaftW = s * 0.085;                    // ~8.5% of square width
+  const headLen = Math.min(s * 0.26, dist * 0.6);  // ~26% of square width
+  const headW = s * 0.22;                      // ~22% of square width
+  const baseX = to.x - Math.cos(ang) * headLen, baseY = to.y - Math.sin(ang) * headLen;
+  const px = -Math.sin(ang), py = Math.cos(ang);
+
+  function headPath(){
+    ctxA.beginPath();
+    ctxA.moveTo(to.x, to.y);
+    ctxA.lineTo(baseX + px*headW/2, baseY + py*headW/2);
+    ctxA.lineTo(baseX - px*headW/2, baseY - py*headW/2);
+    ctxA.closePath();
+  }
+  function pass(strokeColor, fillColor, alpha, widthBoost){
+    ctxA.globalAlpha = alpha;
+    ctxA.lineCap = 'round';
+    ctxA.lineJoin = 'round';
+    ctxA.strokeStyle = strokeColor; ctxA.fillStyle = fillColor;
+    ctxA.lineWidth = shaftW + widthBoost;
+    ctxA.beginPath(); ctxA.moveTo(from.x, from.y); ctxA.lineTo(baseX, baseY); ctxA.stroke();
+    headPath(); ctxA.fill();
+    ctxA.lineWidth = s * 0.02; ctxA.stroke(); // soften the head's corners
+  }
+
+  ctxA.save();
+  pass('rgba(8,7,5,0.9)', 'rgba(8,7,5,0.9)', 0.32, s * 0.03); // dark backing
+  pass(color, color, 0.92, 0);                                // main arrow
+  ctxA.restore();
 }
 
 // Draws a move's badge (e.g. "!!", "?!", "#") as a small chip pinned to the
@@ -1056,6 +1154,20 @@ function toggleStoryTarget(record, sq){
 let currentMode = 'move';
 document.getElementById('mode').addEventListener('change', e=>{ currentMode = e.target.value; });
 
+// The single colour picker stays the one manual override it always was —
+// this only changes what it's ASSUMED to mean before the viewer has ever
+// touched it. Untouched, a highlight defaults to warm amber/gold ("focus")
+// and an arrow to coral/vermilion ("action"), matching the two annotation
+// types' distinct visual language. The moment the viewer picks a colour
+// themselves, that choice is respected for everything drawn afterwards,
+// exactly as before.
+const ANNOTATION_DEFAULT_COLORS = { highlight: '#FFC857', arrow: '#E85D4A' };
+let colorPickedByUser = false;
+document.getElementById('color').addEventListener('input', ()=>{ colorPickedByUser = true; });
+function currentAnnotationColor(kind){
+  return colorPickedByUser ? document.getElementById('color').value : ANNOTATION_DEFAULT_COLORS[kind];
+}
+
 overlay.style.touchAction = 'none';
 overlay.style.pointerEvents = 'auto';
 
@@ -1126,7 +1238,7 @@ function onDown(e){
     if(!sq) return;
     const rec = getActiveRecord();
     if(!rec){ showMessage('Make a move first to annotate it.', 'error'); return; }
-    rec.highlights.push({file:'abcdefgh'.indexOf(sq[0]), rank:8-parseInt(sq[1],10), sq: sq, color: hexToRgba(document.getElementById('color').value,1), alpha:0.28});
+    rec.highlights.push({file:'abcdefgh'.indexOf(sq[0]), rank:8-parseInt(sq[1],10), sq: sq, color: hexToRgba(currentAnnotationColor('highlight'),1), alpha:0.28});
     redrawOverlay();
     updateHistory();
     return;
@@ -1258,7 +1370,7 @@ function onMove(e){
     octx.save();
     octx.translate(viewTransform.panX, viewTransform.panY);
     octx.scale(viewTransform.scale, viewTransform.scale);
-    drawArrow(octx, squareCenter(arrowTemp.from), {x:p.x,y:p.y}, document.getElementById('color').value, 4); 
+    drawArrow(octx, squareCenter(arrowTemp.from), {x:p.x,y:p.y}, currentAnnotationColor('arrow'));
     octx.restore();
     return; 
   }
@@ -1299,7 +1411,7 @@ function onUp(e){
   if(arrowTemp){
     if(sq && sq !== arrowTemp.from){
         const rec = getActiveRecord();
-        if(rec){ rec.arrows.push({from: arrowTemp.from, to: sq, color: document.getElementById('color').value}); updateHistory(); }
+        if(rec){ rec.arrows.push({from: arrowTemp.from, to: sq, color: currentAnnotationColor('arrow')}); updateHistory(); }
         else { showMessage('Make a move first to annotate it.', 'error'); }
     }
     arrowTemp = null;
@@ -2533,12 +2645,12 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       for(const h of recHighlights){
         const vf = boardFlipped ? (7 - h.file) : h.file;
         const vr = boardFlipped ? (7 - h.rank) : h.rank;
-        targetCtx.fillStyle = h.color; targetCtx.globalAlpha = h.alpha; targetCtx.fillRect(vf*s+4, vr*s+4, s-8, s-8); targetCtx.globalAlpha = 1;
+        drawHighlightAt(targetCtx, vf*s, vr*s, s, h.color);
       }
       for(const a of recArrows){
         const from = squareCenter(a.from);
         const to = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
-        drawArrow(targetCtx, from, to, a.color, Math.max(4, LOGICAL_SIZE*0.01));
+        drawArrow(targetCtx, from, to, a.color);
       }
       // Badge (Phase 5): same shared drawBadgeAt() live preview uses, so it
       // looks identical in export — see redrawOverlay().
