@@ -2480,6 +2480,13 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
        - Arrows/highlights get their own, larger allowance (up to the full
          board): a static annotation can't be revealed by panning, so it
          must fit. This preserves the existing annotation-aware crop.
+
+       DIRECTORIAL RULE (camera/piece decoupling): everything above — the
+       trajectory-sized box, the tracking dead zone, all of it — only
+       applies once the move has an explicit creator marker: a Story
+       Target, or an arrow/highlight annotation. Piece movement by itself
+       is never enough; an unmarked move keeps the stable full board no
+       matter how far the piece travels. See hasAnnotations/boxSize below.
     */
     const SQ = LOGICAL_SIZE/8;
     const margin = SQ * 0.5;              // "half square" padding (unchanged)
@@ -2506,7 +2513,11 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     const trajW = trajMaxX - trajMinX, trajH = trajMaxY - trajMinY;
 
     // Annotations (arrows/highlights) must fit statically — they are never
-    // revealed by camera movement.
+    // revealed by camera movement. Story Targets join them here: the
+    // creator marking a square is the same kind of "this is what matters"
+    // signal an arrow or highlight already is, so it widens the frame the
+    // same way — and because annXs/annYs are seeded with the trajectory
+    // bounds, the resulting box always contains the whole move too.
     const annXs = [trajMinX, trajMaxX], annYs = [trajMinY, trajMaxY];
     for(const h of recHighlights){
       const hc = squareCenter(h.sq);
@@ -2519,6 +2530,12 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
       const ac2 = a.to ? squareCenter(a.to) : {x:a.toX, y:a.toY};
       if(ac2){ annXs.push(ac2.x - margin, ac2.x + margin); annYs.push(ac2.y - margin, ac2.y + margin); }
     }
+    const hasStoryTargets = moveRec.storyTargets.length > 0;
+    for(const sq of moveRec.storyTargets){
+      const sc = squareCenter(sq);
+      annXs.push(sc.x - SQ/2 - margin, sc.x + SQ/2 + margin);
+      annYs.push(sc.y - SQ/2 - margin, sc.y + SQ/2 + margin);
+    }
     const annW = Math.max(...annXs) - Math.min(...annXs);
     const annH = Math.max(...annYs) - Math.min(...annYs);
 
@@ -2530,9 +2547,18 @@ function exportLastMoveAsWebM(moveRec, opts={fps:EXPORT_FPS}){
     // seeding would hand the UNCAPPED trajectory extent straight back and
     // silently undo the cap, which is what still made Qa1-a8 open out to
     // the whole board.
-    const hasAnnotations = recHighlights.length > 0 || recArrows.length > 0;
+    const hasAnnotations = recHighlights.length > 0 || recArrows.length > 0 || hasStoryTargets;
     const annBox  = hasAnnotations ? cap(Math.max(annW, annH), MIN_BOX, LOGICAL_SIZE) : 0;
-    const boxSize = Math.min(LOGICAL_SIZE, Math.max(trajBox, annBox));
+    // DIRECTORIAL RULE: piece movement alone must never trigger cinematic
+    // camera behaviour. Only an explicit creator marker — a Story Target,
+    // or an existing arrow/highlight annotation — does. Without one, the
+    // move plays on the stable full board regardless of how far the piece
+    // travels; holdBox/holdCamX/holdCamY and the check-context framing
+    // below both derive their floor from boxSize, so an ordinary move's
+    // post-landing framing (including an incidental check) stays full-board
+    // too, with no separate change needed there. With a marker, this is
+    // exactly the existing trajectory/annotation-aware framing.
+    const boxSize = hasAnnotations ? Math.min(LOGICAL_SIZE, Math.max(trajBox, annBox)) : LOGICAL_SIZE;
 
     // Centre of the whole framed event (trajectory + annotations).
     const eventCX = (Math.min(...annXs) + Math.max(...annXs))/2;
