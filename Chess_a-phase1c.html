@@ -109,8 +109,6 @@ button:active, button.active {
 
 .small{font-size:13px;color:var(--dim-text)}
 .controls-flex{display:flex;gap:6px;flex-wrap:wrap}
-.playerBox{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
-.playerBox input{background:transparent;border:1px solid rgba(255,255,255,0.04);padding:6px;border-radius:6px;color:var(--light)}
 .history{max-height:160px;overflow:auto;margin-top:8px;border-top:1px dashed rgba(255,255,255,0.03);padding-top:8px}
 .hotkeys{margin-top:8px;color:var(--dim-text);font-size:13px}
 #removeToggle.active{background:var(--accent)}
@@ -236,18 +234,6 @@ button:active, button.active {
       </div>
 
       <div class="panel">
-        <div class="playerBox">
-          <input id="whiteName" type="text" placeholder="White name" value="White" class="small">
-          <input id="whiteElo" type="text" placeholder="ELO" value="1600" style="width:80px" class="small">
-          <input id="whiteFlag" type="text" placeholder="🇮🇳" value="🇮🇳" style="width:56px" class="small">
-        </div>
-
-        <div class="playerBox">
-          <input id="blackName" type="text" placeholder="Black name" value="Black" class="small">
-          <input id="blackElo" type="text" placeholder="ELO" value="1650" style="width:80px" class="small">
-          <input id="blackFlag" type="text" placeholder="🇺🇸" value="🇺🇸" style="width:56px" class="small">
-        </div>
-
         <div class="row">
           <label>Mode:</label>
           <select id="mode">
@@ -268,6 +254,12 @@ button:active, button.active {
             <option value="implosion">Implosion</option>
             <option value="drift">Directional Dissolve</option>
             <option value="burst">Impact Burst</option>
+          </select>
+          <label>Board</label>
+          <select id="boardTheme">
+            <option value="classic" selected>Classic</option>
+            <option value="obsidian">Obsidian / Ivory</option>
+            <option value="walnut">Walnut / Cream</option>
           </select>
         </div>
 
@@ -600,20 +592,29 @@ function readyInit(){
 }
 
 /* ---------------- DRAWING (MODIFIED for Pan/Zoom) ---------------- */
-// Chess Cinema board palette: muted sage-green dark squares, warm cream
-// light squares — a conventional-but-independent green chessboard, not a
-// copy of any specific reference site's exact colors.
-const darkColor = '#4f6f3c';
-const darkColorTop = '#6f9156';
-const lightColorTop = '#f1e9d8';
-const lightColorBottom = '#e2d6ba';
+// Chess Cinema board themes: a small, flat config object, one entry per
+// theme. paintSquare() below is the single place that reads from it, so
+// every renderer (live board, live animation overlay, and the export's
+// drawBoardToTemp) picks up the active theme automatically — no color
+// conditionals elsewhere. "classic" carries the original muted sage-green/
+// cream gradient values unchanged; the two new themes use the same
+// top/bottom pair twice, which makes createLinearGradient paint a flat,
+// ungraded color (per their "no gradients" requirement) without a second
+// rendering code path.
+const BOARD_THEMES = {
+  classic:  { darkTop:'#6f9156', darkBottom:'#4f6f3c', lightTop:'#f1e9d8', lightBottom:'#e2d6ba' },
+  obsidian: { darkTop:'#1a1b1e', darkBottom:'#1a1b1e', lightTop:'#efe7d3', lightBottom:'#efe7d3' },
+  walnut:   { darkTop:'#5c3a22', darkBottom:'#5c3a22', lightTop:'#f3e3c0', lightBottom:'#f3e3c0' }
+};
+let currentBoardTheme = 'classic';
 
 // Shared by drawBoard() (live) and drawBoardToTemp() (export) so the two
 // renderers can never diverge on square color.
 function paintSquare(targetCtx, x, y, s, isDark){
+  const theme = BOARD_THEMES[currentBoardTheme] || BOARD_THEMES.classic;
   const g = targetCtx.createLinearGradient(x,y,x+s,y+s);
-  if(isDark){ g.addColorStop(0,darkColorTop); g.addColorStop(1,darkColor); }
-  else { g.addColorStop(0,lightColorTop); g.addColorStop(1,lightColorBottom); }
+  if(isDark){ g.addColorStop(0,theme.darkTop); g.addColorStop(1,theme.darkBottom); }
+  else { g.addColorStop(0,theme.lightTop); g.addColorStop(1,theme.lightBottom); }
   targetCtx.fillStyle = g;
   targetCtx.fillRect(x,y,s,s);
 }
@@ -1850,8 +1851,20 @@ function drawMovingImage(img, x, y, scale=1, angle=0, useOverlay=true){
 
 function quadBezier(p0,p1,p2,t){ const x = Math.pow(1-t,2)*p0.x + 2*(1-t)*t*p1.x + Math.pow(t,2)*p2.x; const y = Math.pow(1-t,2)*p0.y + 2*(1-t)*t*p1.y + Math.pow(t,2)*p2.y; return {x,y}; }
 function cubicBezier(p0,p1,p2,p3,t){ const x = Math.pow(1-t,3)*p0.x + 3*Math.pow(1-t,2)*t*p1.x + 3*(1-t)*Math.pow(t,2)*p2.x + Math.pow(t,3)*p3.x; const y = Math.pow(1-t,3)*p0.y + 3*Math.pow(1-t,2)*t*p1.y + 3*(1-t)*Math.pow(t,2)*p2.y + Math.pow(t,3)*p3.y; return {x,y}; }
-function easeOutCubic(t){ return 1 - Math.pow(1 - t, 3); }
+// Power 3 (cubic) spends its last ~10-15% of travel at under 5% of peak
+// speed — visually a "slow crawl" right before landing. Power 1.6 keeps the
+// same fast-start/soft-settle ease-out shape (still 0 velocity exactly at
+// t=1, still not linear) but with a much shorter, gentler tail, which is
+// the only change needed to remove the arrival hesitation — the curve
+// shape and every call site are otherwise unchanged.
+const ARRIVAL_EASE_POWER = 1.6;
+function easeOutCubic(t){ return 1 - Math.pow(1 - t, ARRIVAL_EASE_POWER); }
 function easeInOutCubic(t){ return t<0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2,3)/2; }
+// King-only variant of easeInOutCubic's own shape, same ARRIVAL_EASE_POWER
+// softening as easeOutCubic above, kept as a separate function so the
+// shared easeInOutCubic (also used by the unrelated pinch-zoom/camera-hold
+// easing below) is never touched.
+function easeInOutMild(t){ return t<0.5 ? Math.pow(2*t, ARRIVAL_EASE_POWER)/2 : 1 - Math.pow(2*(1-t), ARRIVAL_EASE_POWER)/2; }
 
 /* ---------------- SHARED PIECE TRAJECTORY (single source of truth) ----------------
    ONE definition of "where is this piece, how big is it, and how is it
@@ -1871,8 +1884,9 @@ function easeInOutCubic(t){ return t<0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2,3)/2; }
 function pieceTrajectory(type, start, end, t){
   const s = LOGICAL_SIZE/8;
   // The king's original curve eases differently (and deliberately stops
-  // slightly short via t*0.9) — preserved exactly.
-  const e = (type === 'k') ? easeInOutCubic(t*0.9) : easeOutCubic(t);
+  // slightly short via t*0.9) — preserved exactly, only the tail softness
+  // (easeInOutMild vs easeInOutCubic) changes, same as easeOutCubic above.
+  const e = (type === 'k') ? easeInOutMild(t*0.9) : easeOutCubic(t);
   const bob = 1 - Math.abs(0.5 - e);
   if(type === 'n'){
     const mid = { x: (start.x+end.x)/2, y: (start.y+end.y)/2 - Math.max(s*0.5, Math.hypot(end.x-start.x, end.y-start.y)*0.28) };
@@ -2096,6 +2110,7 @@ document.getElementById('importPgn').addEventListener('click', ()=>{
 });
 document.getElementById('flip').addEventListener('click', ()=>{ boardFlipped = !boardFlipped; drawBoard(); redrawOverlay(); });
 document.getElementById('captureFx').addEventListener('change', (e)=>{ captureEffect = e.target.value; });
+document.getElementById('boardTheme').addEventListener('change', (e)=>{ currentBoardTheme = e.target.value; drawBoard(); redrawOverlay(); });
 // Play/Export operate on the ACTIVE record — the selected timeline move if
 // one is selected, else the latest move (getActiveRecord()'s default) —
 // so previewing/exporting an older move works exactly like the latest one.
